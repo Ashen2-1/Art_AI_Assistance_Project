@@ -2,7 +2,7 @@
 
 Fine-tuning open-source vision-language models (VLMs) to better understand artworks – styles, periods, and visual features – and integrating them into the Nexo art research platform.
 
----
+
 
 ## Overview
 
@@ -21,7 +21,7 @@ For serious art students and researchers, this “generic” vision understandin
 - Fine-tune open-source VLMs on this dataset  
 - Serve the improved model as part of the broader **Nexo Art Research Platform**
 
----
+
 
 ## Goals
 
@@ -34,7 +34,7 @@ For serious art students and researchers, this “generic” vision understandin
   - “What style/period is this likely from?”
   - “What research questions could I explore from this artwork?”
 
----
+
 
 ## High-level Approach
 
