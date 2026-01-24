@@ -4,7 +4,7 @@ Fine-tuning open-source vision-language models (VLMs) to better understand artwo
 
 ---
 
-## 🔍 Overview
+## Overview
 
 Most general VLMs are trained on broad internet images and **do not understand art history very well**.  
 They often:
@@ -23,7 +23,7 @@ For serious art students and researchers, this “generic” vision understandin
 
 ---
 
-## 🎯 Goals
+## Goals
 
 - Improve VLM performance on:
   - Art style classification (e.g., Baroque, Impressionism, Surrealism)
@@ -36,14 +36,14 @@ For serious art students and researchers, this “generic” vision understandin
 
 ---
 
-## 🧠 High-level Approach
+## High-level Approach
 
 ### 1. Dataset: Art-focused multimodal data
 
 We plan to collect and curate:
 
-- ✅ Public-domain artwork images (museums, open art datasets, etc.)
-- ✅ Metadata & labels:
+- Public-domain artwork images (museums, open art datasets, etc.)
+- Metadata & labels:
   - Artist, period, style, movement
   - Important visual features (composition, color, medium)
   - Short expert-style descriptions (where available)
