@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# ChromaDB local data
+art_rag_db/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp / uploads
+*.tmp
+tmp/
+
+# Model cache (large HuggingFace downloads)
+# Uncomment if you don't want to track model weights
+# .cache/
