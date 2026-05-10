@@ -31,8 +31,10 @@ import uvicorn
 # local modules
 sys.path.insert(0, str(Path(__file__).parent))
 from db import init_db, get_stats, list_sources, delete_source as db_delete
+from db import list_artworks, delete_artwork as db_delete_artwork
 from embed_pipeline import ingest_pdf
 from rag_query import query_text_rag, query_vlm_only, query_hybrid
+from image_pipeline import ingest_image, search_images
 
 # ── API Key Auth ───────────────────────────────────────────────
 # Set your key here or override via environment variable API_KEY
@@ -260,6 +262,120 @@ async def delete_source_endpoint(source_name: str):
         "status" : "deleted",
         "source" : source_name,
         "removed": deleted,
+    }
+
+
+# ── POST /ingest/image ────────────────────────────────────────
+@app.post("/ingest/image", summary="Upload an artwork image — LLaVA describes it",
+          dependencies=[Depends(require_api_key)])
+async def ingest_image_endpoint(
+    image        : UploadFile    = File(..., description="Artwork image (jpg, png, etc.)"),
+    custom_prompt: Optional[str] = Form(None, description="Override the default art description prompt"),
+):
+    """
+    IMAGE INGESTION PIPELINE:
+    1. Saves the image to artwork_store/
+    2. LLaVA generates a detailed art-history description
+    3. BGE embeds the description
+    4. Stores filename + description + embedding in PostgreSQL
+
+    Re-uploading the same filename replaces the old record.
+    """
+    tmp_path = os.path.join(tempfile.gettempdir(), f"ingest_{image.filename}")
+    with open(tmp_path, "wb") as f:
+        shutil.copyfileobj(image.file, f)
+
+    try:
+        result = ingest_image(tmp_path, custom_prompt=custom_prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    return {
+        "status"     : "ok",
+        "id"         : result["id"],
+        "filename"   : result["filename"],
+        "description": result["description"],
+    }
+
+
+# ── GET /images ───────────────────────────────────────────────
+@app.get("/images", summary="List all ingested artwork images",
+         dependencies=[Depends(require_api_key)])
+async def get_images():
+    """Return all artwork images stored in the database."""
+    artworks = list_artworks()
+    return {
+        "total"   : len(artworks),
+        "artworks": [
+            {
+                "id"         : a["id"],
+                "filename"   : a["filename"],
+                "description": a["description"][:200] + "...",
+                "created_at" : str(a["created_at"]),
+            }
+            for a in artworks
+        ],
+    }
+
+
+# ── POST /query/images ────────────────────────────────────────
+@app.post("/query/images", summary="Search artwork images by text query",
+          dependencies=[Depends(require_api_key)])
+async def query_images(
+    query: str = Form(..., description="Describe what you are looking for"),
+    top_k: int = Form(3,   description="Number of results to return"),
+):
+    """
+    IMAGE SEARCH MODE:
+    Embed the text query with BGE and find the most semantically
+    similar artwork images based on their LLaVA descriptions.
+
+    Example queries:
+      - "dark surrealist painting with distorted figures"
+      - "portrait of a woman with melancholic expression"
+      - "landscape with dramatic storm clouds"
+    """
+    try:
+        results = search_images(query, top_k=top_k)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not results:
+        return {"query": query, "results": [], "message": "No artworks ingested yet."}
+
+    return {
+        "query"  : query,
+        "results": [
+            {
+                "filename"   : r["filename"],
+                "similarity" : round(float(r["score"]), 4),
+                "description": r["description"],
+            }
+            for r in results
+        ],
+    }
+
+
+# ── DELETE /image/{filename} ──────────────────────────────────
+@app.delete("/image/{filename}", summary="Remove an artwork image from the database",
+            dependencies=[Depends(require_api_key)])
+async def delete_image_endpoint(filename: str):
+    """
+    Deletes the artwork record from PostgreSQL.
+    Example: DELETE /image/starry_night.jpg
+    """
+    deleted = db_delete_artwork(filename)
+    if deleted == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{filename}' not found in database.",
+        )
+    return {
+        "status"  : "deleted",
+        "filename": filename,
     }
 
 

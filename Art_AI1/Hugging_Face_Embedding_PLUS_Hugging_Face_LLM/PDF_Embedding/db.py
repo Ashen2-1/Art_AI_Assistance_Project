@@ -64,6 +64,23 @@ def init_db():
                 ON pdf_chunks USING hnsw (embedding vector_cosine_ops);
             """)
 
+            # ── Artwork images table ──────────────────────────────
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS artwork_images (
+                    id          SERIAL       PRIMARY KEY,
+                    filename    VARCHAR(500) NOT NULL UNIQUE,
+                    filepath    TEXT         NOT NULL,
+                    description TEXT         NOT NULL,
+                    embedding   vector({EMBEDDING_DIM}),
+                    created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_artworks_embedding
+                ON artwork_images USING hnsw (embedding vector_cosine_ops);
+            """)
+
         conn.commit()
         print("[DB] PostgreSQL schema ready.")
     finally:
@@ -180,6 +197,96 @@ def delete_source(source_name: str) -> int:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM pdf_chunks WHERE source = %s;", (source_name,)
+            )
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+# ── Artwork image CRUD ────────────────────────────────────────
+def insert_artwork(
+    filename   : str,
+    filepath   : str,
+    description: str,
+    embedding  : List[float],
+) -> int:
+    """
+    Insert or replace an artwork image record.
+    Returns the new row id.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # Replace if same filename already exists
+            cur.execute("DELETE FROM artwork_images WHERE filename = %s;", (filename,))
+            cur.execute(
+                """
+                INSERT INTO artwork_images (filename, filepath, description, embedding)
+                VALUES (%s, %s, %s, %s::vector)
+                RETURNING id;
+                """,
+                (filename, filepath, description, embedding),
+            )
+            row_id = cur.fetchone()[0]
+        conn.commit()
+        return row_id
+    finally:
+        conn.close()
+
+
+def search_artworks(
+    query_embedding: List[float],
+    top_k: int = 3,
+) -> List[dict]:
+    """
+    Find the most visually/semantically similar artworks
+    using cosine similarity on their LLaVA descriptions.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT filename, filepath, description,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM   artwork_images
+                ORDER  BY embedding <=> %s::vector
+                LIMIT  %s;
+                """,
+                (query_embedding, query_embedding, top_k),
+            )
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_artworks() -> List[dict]:
+    """Return all stored artwork records (without embeddings)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, filename, filepath, description,
+                       created_at
+                FROM   artwork_images
+                ORDER  BY created_at DESC;
+                """
+            )
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def delete_artwork(filename: str) -> int:
+    """Delete an artwork by filename. Returns rows deleted."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM artwork_images WHERE filename = %s;", (filename,)
             )
             deleted = cur.rowcount
         conn.commit()

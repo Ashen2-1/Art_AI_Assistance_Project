@@ -15,6 +15,9 @@ env/
 # ChromaDB local data
 art_rag_db/
 
+# Artwork image store (user uploads)
+artwork_store/
+
 # IDE
 .idea/
 *.iml
