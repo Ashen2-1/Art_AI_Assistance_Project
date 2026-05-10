@@ -18,11 +18,13 @@
 import os
 import sys
 import shutil
+import secrets
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -31,6 +33,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 from db import init_db, get_stats, list_sources, delete_source as db_delete
 from embed_pipeline import ingest_pdf
 from rag_query import query_text_rag, query_vlm_only, query_hybrid
+
+# ── API Key Auth ───────────────────────────────────────────────
+# Set your key here or override via environment variable API_KEY
+API_KEY       = os.getenv("API_KEY", "artai-secret-key-2026")
+API_KEY_NAME  = "X-API-Key"          # header name Postman sends
+
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+
+def require_api_key(key: str = Security(api_key_header)):
+    """Dependency — rejects requests with wrong or missing API key."""
+    if key != API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing API key. Add header: X-API-Key: <your-key>",
+        )
+    return key
+
 
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(
@@ -48,7 +68,8 @@ def startup():
 
 
 # ── POST /ingest ──────────────────────────────────────────────
-@app.post("/ingest", summary="Upload a PDF and ingest it into the database")
+@app.post("/ingest", summary="Upload a PDF and ingest it into the database",
+          dependencies=[Depends(require_api_key)])
 async def ingest(
     file    : UploadFile = File(...,  description="PDF file to ingest"),
     ocr_mode: str        = Form("printed", description="printed | cursive"),
@@ -90,7 +111,8 @@ async def ingest(
 
 
 # ── POST /query/text ──────────────────────────────────────────
-@app.post("/query/text", summary="Ask a question answered from ingested PDFs")
+@app.post("/query/text", summary="Ask a question answered from ingested PDFs",
+          dependencies=[Depends(require_api_key)])
 async def query_text(
     question     : str           = Form(..., description="Your research question"),
     top_k        : int           = Form(3,   description="Number of chunks to retrieve"),
@@ -123,7 +145,8 @@ async def query_text(
 
 
 # ── POST /query/vlm ───────────────────────────────────────────
-@app.post("/query/vlm", summary="Analyze an artwork image with LLaVA")
+@app.post("/query/vlm", summary="Analyze an artwork image with LLaVA",
+          dependencies=[Depends(require_api_key)])
 async def query_vlm(
     question: str        = Form(..., description="Your question about the image"),
     image   : UploadFile = File(..., description="Artwork image (jpg, png, etc.)"),
@@ -154,7 +177,8 @@ async def query_vlm(
 
 
 # ── POST /query/hybrid ────────────────────────────────────────
-@app.post("/query/hybrid", summary="Analyze image + retrieved text chunks together")
+@app.post("/query/hybrid", summary="Analyze image + retrieved text chunks together",
+          dependencies=[Depends(require_api_key)])
 async def query_hybrid_endpoint(
     question     : str           = Form(...,  description="Your research question"),
     image        : UploadFile    = File(...,  description="Artwork image"),
@@ -200,13 +224,15 @@ async def query_hybrid_endpoint(
 
 
 # ── GET /sources ──────────────────────────────────────────────
-@app.get("/sources", summary="List all ingested PDF filenames")
+@app.get("/sources", summary="List all ingested PDF filenames",
+         dependencies=[Depends(require_api_key)])
 async def sources():
     return {"sources": list_sources()}
 
 
 # ── GET /stats ────────────────────────────────────────────────
-@app.get("/stats", summary="Database statistics")
+@app.get("/stats", summary="Database statistics",
+         dependencies=[Depends(require_api_key)])
 async def stats():
     s = get_stats()
     return {
@@ -217,7 +243,8 @@ async def stats():
 
 
 # ── DELETE /source/{name} ─────────────────────────────────────
-@app.delete("/source/{source_name}", summary="Remove a PDF from the database")
+@app.delete("/source/{source_name}", summary="Remove a PDF from the database",
+            dependencies=[Depends(require_api_key)])
 async def delete_source_endpoint(source_name: str):
     """
     Deletes all chunks for the given PDF filename.
