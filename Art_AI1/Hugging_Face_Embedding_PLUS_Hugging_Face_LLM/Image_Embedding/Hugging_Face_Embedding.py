@@ -68,7 +68,7 @@ captioner = pipeline(
     device=0 if DEVICE == "cuda" else -1,
 )
 
-# 你的文本LLM（你之前用过）
+#
 text_llm = pipeline(
     task="text-generation",
     model="microsoft/Phi-3-mini-4k-instruct",

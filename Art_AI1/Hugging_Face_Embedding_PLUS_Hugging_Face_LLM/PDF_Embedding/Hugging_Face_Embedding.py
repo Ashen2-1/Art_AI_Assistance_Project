@@ -9,6 +9,7 @@ from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoa
 ### We will first test using a PDF
 ### PyPDFLoader from LangChain to extract the text from the PDF
 path = "Sigmund.pdf"
+#path = "barthes.pdf"
 try:
     loader = PyPDFLoader(path)
     docs = loader.load()
@@ -101,6 +102,8 @@ for i, line in enumerate(tqdm(text_lines, desc="Creating embeddings")):
     ids.append(str(i))                # Chroma 的 id 要是 str
     embeddings.append(emb_text(line)) # 我们已经自己算好 embedding
     metadatas.append({"text": line})  # 把原始文本放进 metadata
+    print("Chunk: ", i,"=============================")
+    print(line)
 
 # 一次性插入
 collection.add(

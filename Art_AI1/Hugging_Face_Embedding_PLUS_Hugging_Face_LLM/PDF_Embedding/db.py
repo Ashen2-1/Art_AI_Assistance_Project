@@ -8,6 +8,9 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Connection config (override via environment variables) ────
 DB_CONFIG = {
