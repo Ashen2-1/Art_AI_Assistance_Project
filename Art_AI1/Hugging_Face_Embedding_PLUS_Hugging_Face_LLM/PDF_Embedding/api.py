@@ -27,13 +27,14 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Security, De
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 import uvicorn
+import json
 
 # local modules
 sys.path.insert(0, str(Path(__file__).parent))
 from db import init_db, get_stats, list_sources, delete_source as db_delete
 from db import list_artworks, delete_artwork as db_delete_artwork
 from embed_pipeline import ingest_pdf
-from rag_query import query_text_rag, query_vlm_only, query_hybrid
+from rag_query import query_text_rag, query_vlm_only, query_hybrid, query_general
 from image_pipeline import ingest_image, search_images
 
 # ── API Key Auth ───────────────────────────────────────────────
@@ -119,6 +120,7 @@ async def query_text(
     question     : str           = Form(..., description="Your research question"),
     top_k        : int           = Form(3,   description="Number of chunks to retrieve"),
     source_filter: Optional[str] = Form(None, description="Limit to one PDF filename"),
+    chat_history: str            = Form("[]", description="Previous chat messages as JSON"),
 ):
     """
     TEXT RAG MODE:
@@ -126,7 +128,8 @@ async def query_text(
     strictly from those chunks. No image required.
     """
     try:
-        result = query_text_rag(question, top_k=top_k, source_filter=source_filter)
+        history = json.loads(chat_history)
+        result = query_text_rag(question, top_k=top_k, source_filter=source_filter, chat_history=history)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -145,6 +148,28 @@ async def query_text(
         ],
     }
 
+
+@app.post("/query/general", summary="Ask a general question question without any of the documents", dependencies=[Depends(require_api_key)])
+async def query_general_endpoint(
+    question : str = Form(..., description="Your general question"),
+    chat_history: str            = Form("[]", description="Previous chat messages as JSON"),
+):
+    """
+    GENERAL CHAT MODE:
+    Answers normal questions without requiring selected documents or RAG context.
+    """
+    try:
+        history = json.loads(chat_history)
+        result = query_general(question, chat_history=history)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "mode" : "general_chat",
+        "question" : question,
+        "answer" : result["answer"],
+        "sources" : [],
+    }
 
 # ── POST /query/vlm ───────────────────────────────────────────
 @app.post("/query/vlm", summary="Analyze an artwork image with LLaVA",

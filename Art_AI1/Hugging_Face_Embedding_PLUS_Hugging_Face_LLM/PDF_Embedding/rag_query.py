@@ -121,12 +121,38 @@ def retrieve(
 # ── Generation ────────────────────────────────────────────────
 SYSTEM_MSG = (
     "You are an expert AI research assistant specialising in art history.\n"
-    "Answer ONLY based on the provided context and/or image.\n"
+    "Answer ONLY based on the provided context and/or image when RAG context is supplied.\n"
+    "Use the conversation history to understand follow-up questions.\n"
     "If the answer cannot be found in the context, say exactly: "
     "'I cannot find this in the provided sources.'\n"
+    "Format answers clearly using short paragraphs.\n"
+    "Use Markdown formatting.\n"
+    "If using bullet points or numbered points, place each item on its own line.\n"
+    "Avoid large dense walls of text.\n"
     "Be precise. When possible, mention which source supports your answer."
 )
 
+def format_chat_history(chat_history: list) -> str:
+    if not chat_history:
+        return "No previous conversation"
+
+    lines = []
+
+    for msg in chat_history[-8:]:
+        role = msg.get("role", "user")
+        content = msg.get("content", "").strip()
+
+        if not content:
+            continue
+
+        if role == "ai":
+            role_label = "ASSISTANT"
+        else:
+            role_label = "USER"
+
+        lines.append(f"{role_label} {content}")
+
+    return "\n".join(lines) if lines else "No previous conversation"
 
 def _generate(prompt: str, image: Optional[Image.Image] = None) -> str:
     """Run LLaVA inference. Pass image=None for text-only queries."""
@@ -166,6 +192,7 @@ def query_text_rag(
     question: str,
     top_k: int = TOP_K,
     source_filter: Optional[str] = None,
+    chat_history: list = None,
 ) -> dict:
     """
     TEXT RAG MODE
@@ -196,8 +223,14 @@ def query_text_rag(
         for c in chunks
     )
 
+    history_text = format_chat_history(chat_history or [])
+
     prompt = (
         f"{SYSTEM_MSG}\n\n"
+        "Use the conversation history to understand follow-up questions.\n"
+        "However, final factual claims must be supported by the provided context.\n\n"
+        f"Selected source file: {source_filter or 'None'}\n\n"
+        f"<conversation_history>\n{history_text}\n</conversation_history>\n\n"
         f"<context>\n{context}\n</context>\n\n"
         f"Question: {question}\n\n"
         f"ASSISTANT:"
@@ -205,6 +238,42 @@ def query_text_rag(
 
     answer = _generate(prompt, image=None)
     return {"answer": answer, "chunks": chunks, "mode": "text_rag"}
+
+
+def query_general(question: str, chat_history: list = None) -> dict:
+    """
+    GENERAL CHAT MODE
+    -----------------
+    Answer general questions without requiring PDF context.
+    Best for greetings, explanations, coding questions, and basic help.
+    """
+    print(f"\n[RAG] Mode: GENERAL CHAT  |  question: {question!r}")
+
+    history_text = format_chat_history(chat_history or [])
+
+    prompt = (
+        "You are a helpful AI assistant.\n"
+        "Continue the conversation naturally.\n"
+        "Use the previous conversation for context when relevant.\n"
+        "If the user asks a follow-up question, connect it to the earlier topic.\n"
+        "Answer clearly and helpfully.\n"
+        "Use Markdown formatting.\n"
+        "Use short paragraphs.\n"
+        "Use bullet points or numbered lists when helpful.\n"
+        "Put each list item on its own line.\n"
+        "Avoid giant unbroken blocks of text.\n\n"
+        f"<conversation_history>\n{history_text}\n</conversation_history>\n\n"
+        f"USER: {question}\n\n"
+        "ASSISTANT:"
+    )
+
+    answer = _generate(prompt, image=None)
+
+    return {
+        "answer": answer,
+        "mode": "general_chat",
+        "chunks": [],
+    }
 
 
 # ── MODE 2: VLM Only ──────────────────────────────────────────
