@@ -1,0 +1,1 @@
+Scanned archive catalog records, permission letters, and access agreements — the actual documents, not just the summary row in 03_ArchiveSources.csv. File naming: {ArchiveName}_{DocumentType}_{Date}.pdf
