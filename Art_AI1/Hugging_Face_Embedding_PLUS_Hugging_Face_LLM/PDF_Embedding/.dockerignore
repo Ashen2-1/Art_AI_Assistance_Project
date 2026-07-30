@@ -1,0 +1,13 @@
+.env
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.log
+.git
+.idea
+.vscode
+artwork_store
+*.zip
+*.pdf

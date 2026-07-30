@@ -26,7 +26,16 @@ from PIL import Image, ImageEnhance, ImageFilter
 from pypdf import PdfReader
 
 # ── Tesseract binary (Windows) ────────────────────────────────
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = os.getenv(
+        "TESSERACT_CMD",
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    )
+else:
+    pytesseract.pytesseract.tesseract_cmd = os.getenv(
+        "TESSERACT_CMD",
+        "tesseract",
+    )
 
 # ── Tuning knobs ──────────────────────────────────────────────
 MIN_CHARS_PER_PAGE    = 100   # avg chars/page below this → treat as scanned

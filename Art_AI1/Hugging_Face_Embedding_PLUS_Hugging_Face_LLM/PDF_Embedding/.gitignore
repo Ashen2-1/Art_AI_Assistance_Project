@@ -1,1 +1,13 @@
 .env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+.idea/
+.vscode/
+artwork_store/
+*.zip
+*.pdf
+*_backup.py
+test_*.py

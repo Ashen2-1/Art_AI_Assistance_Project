@@ -1,409 +1,309 @@
-################################################################
-### Art AI — FastAPI Server
-###
-### Endpoints:
-###   POST   /ingest              Upload PDF -> embed -> store
-###   POST   /query/text          Question -> RAG answer
-###   POST   /query/vlm           Image + question -> LLaVA answer
-###   POST   /query/hybrid        Image + question + chunks -> answer
-###   GET    /sources             List all ingested PDFs
-###   GET    /stats               DB statistics
-###   DELETE /source/{name}       Remove a PDF from the DB
-###
-### Run:
-###   python api.py
-###   (or)  uvicorn api:app --reload --port 8000
-################################################################
-
+import json
 import os
-import sys
 import shutil
-import secrets
 import tempfile
+import hmac
+
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Security, Depends
+from dotenv import load_dotenv
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Security,
+    UploadFile,
+)
 from fastapi.security.api_key import APIKeyHeader
-from fastapi.responses import JSONResponse
 import uvicorn
-import json
 
-# local modules
-sys.path.insert(0, str(Path(__file__).parent))
-from db import init_db, get_stats, list_sources, delete_source as db_delete
-from db import list_artworks, delete_artwork as db_delete_artwork
+from db import (
+    delete_source as db_delete_source,
+    get_stats,
+    init_db,
+    list_sources,
+)
 from embed_pipeline import ingest_pdf
-from rag_query import query_text_rag, query_vlm_only, query_hybrid, query_general
-from image_pipeline import ingest_image, search_images
-
-# ── API Key Auth ───────────────────────────────────────────────
-# Set your key here or override via environment variable API_KEY
-API_KEY       = os.getenv("API_KEY", "artai-secret-key-2026")
-API_KEY_NAME  = "X-API-Key"          # header name Postman sends
-
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+from rag_query import query_general, query_text_rag
 
 
-def require_api_key(key: str = Security(api_key_header)):
-    """Dependency — rejects requests with wrong or missing API key."""
-    if key != API_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing API key. Add header: X-API-Key: <your-key>",
-        )
-    return key
+load_dotenv()
 
+API_KEY = os.getenv("API_KEY", "").strip()
+API_KEY_HEADER_NAME = "X-API-Key"
 
-# ── App setup ─────────────────────────────────────────────────
-app = FastAPI(
-    title       = "Art AI RAG API",
-    description = "PDF ingestion + LLaVA-powered art history research assistant",
-    version     = "1.0.0",
+api_key_header = APIKeyHeader(
+    name=API_KEY_HEADER_NAME,
+    auto_error=False,
 )
 
 
-@app.on_event("startup")
-def startup():
-    """Ensure DB tables exist when the server starts."""
-    init_db()
-    print("[API] Server ready.")
-
-
-# ── POST /ingest ──────────────────────────────────────────────
-@app.post("/ingest", summary="Upload a PDF and ingest it into the database",
-          dependencies=[Depends(require_api_key)])
-async def ingest(
-    file    : UploadFile = File(...,  description="PDF file to ingest"),
-    ocr_mode: str        = Form("printed", description="printed | cursive"),
+def require_api_key(
+    provided_key: Optional[str] = Security(api_key_header),
 ):
-    """
-    Upload a PDF file.
-    - Extracts and chunks the text (pdfplumber or OCR)
-    - Embeds chunks with BGE-small
-    - Stores in PostgreSQL + pgvector
+    if not API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="The FastAPI API_KEY is not configured.",
+        )
 
-    Re-uploading the same filename replaces the old data.
-    """
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+    if (
+        not provided_key
+        or not hmac.compare_digest(provided_key, API_KEY)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing API key.",
+        )
 
-    if ocr_mode not in ("printed", "cursive"):
-        raise HTTPException(status_code=400, detail="ocr_mode must be 'printed' or 'cursive'.")
+    return provided_key
 
-    # Save upload to a temp file
-    tmp_path = os.path.join(tempfile.gettempdir(), file.filename)
-    with open(tmp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+
+def parse_chat_history(chat_history: str):
+    try:
+        history = json.loads(chat_history)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="chat_history must be valid JSON.",
+        )
+
+    if not isinstance(history, list):
+        raise HTTPException(
+            status_code=400,
+            detail="chat_history must be a JSON array.",
+        )
+
+    return history
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not API_KEY:
+        raise RuntimeError(
+            "API_KEY is missing. Add API_KEY to the Python .env file."
+        )
+
+    init_db()
+    print("[NEXO RAG API] Database ready.")
+    yield
+
+
+app = FastAPI(
+    title="NEXO Multidisciplinary RAG API",
+    description=(
+        "Document ingestion and grounded AI research assistance "
+        "for arts, humanities, engineering, mathematics, science, "
+        "and other research fields."
+    ),
+    version="1.1.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "nexo-rag-api",
+    }
+
+
+@app.post(
+    "/query/general",
+    dependencies=[Depends(require_api_key)],
+)
+async def query_general_endpoint(
+    question: str = Form(...),
+    chat_history: str = Form("[]"),
+):
+    history = parse_chat_history(chat_history)
 
     try:
-        n = ingest_pdf(tmp_path, ocr_mode=ocr_mode)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        result = query_general(
+            question,
+            chat_history=history,
+        )
+    except Exception as error:
+        print(f"[GENERAL QUERY ERROR] {error}")
+        raise HTTPException(
+            status_code=500,
+            detail="The AI service could not answer the question.",
+        )
+
+    return {
+        "mode": "general_chat",
+        "question": question,
+        "answer": result["answer"],
+        "sources": [],
+    }
+
+
+@app.post(
+    "/query/text",
+    dependencies=[Depends(require_api_key)],
+)
+async def query_text_endpoint(
+    question: str = Form(...),
+    top_k: int = Form(3),
+    source_filter: Optional[str] = Form(None),
+    chat_history: str = Form("[]"),
+):
+    history = parse_chat_history(chat_history)
+    safe_top_k = max(1, min(top_k, 10))
+
+    try:
+        result = query_text_rag(
+            question,
+            top_k=safe_top_k,
+            source_filter=source_filter,
+            chat_history=history,
+        )
+    except Exception as error:
+        print(f"[TEXT RAG ERROR] {error}")
+        raise HTTPException(
+            status_code=500,
+            detail="The RAG service could not answer the question.",
+        )
+
+    return {
+        "mode": "text_rag",
+        "question": question,
+        "answer": result["answer"],
+        "sources": [
+            {
+                "file": chunk["source"],
+                "chunk": chunk["chunk_idx"] + 1,
+                "similarity": round(float(chunk["score"]), 4),
+                "preview": chunk["text"][:300].replace("\n", " "),
+            }
+            for chunk in result.get("chunks", [])
+        ],
+    }
+
+
+@app.post(
+    "/ingest",
+    dependencies=[Depends(require_api_key)],
+)
+async def ingest_document(
+    file: UploadFile = File(...),
+    ocr_mode: str = Form("printed"),
+):
+    original_name = Path(file.filename or "document.pdf").name
+
+    if not original_name.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are currently accepted.",
+        )
+
+    if ocr_mode != "printed":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only printed OCR is available in the current "
+                "lightweight deployment."
+            ),
+        )
+
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf",
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+            shutil.copyfileobj(file.file, temporary_file)
+
+        chunks_added = ingest_pdf(
+            temporary_path,
+            ocr_mode=ocr_mode,
+            source_name=original_name,
+        )
+    except TypeError:
+        # Compatibility with the current ingest_pdf signature.
+        chunks_added = ingest_pdf(
+            temporary_path,
+            ocr_mode=ocr_mode,
+        )
+    except Exception as error:
+        print(f"[INGEST ERROR] {error}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document ingestion failed: {error}",
+        )
     finally:
-        os.remove(tmp_path)
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
     stats = get_stats()
+
     return {
-        "status"      : "ok",
-        "file"        : file.filename,
-        "chunks_added": n,
-        "db_total"    : stats["total_chunks"],
-        "sources"     : stats["sources"],
+        "status": "ok",
+        "file": original_name,
+        "chunks_added": chunks_added,
+        "database_total": stats["total_chunks"],
+        "sources": stats["sources"],
     }
 
 
-# ── POST /query/text ──────────────────────────────────────────
-@app.post("/query/text", summary="Ask a question answered from ingested PDFs",
-          dependencies=[Depends(require_api_key)])
-async def query_text(
-    question     : str           = Form(..., description="Your research question"),
-    top_k        : int           = Form(3,   description="Number of chunks to retrieve"),
-    source_filter: Optional[str] = Form(None, description="Limit to one PDF filename"),
-    chat_history: str            = Form("[]", description="Previous chat messages as JSON"),
-):
-    """
-    TEXT RAG MODE:
-    Retrieves the most relevant PDF chunks and asks LLaVA to answer
-    strictly from those chunks. No image required.
-    """
-    try:
-        history = json.loads(chat_history)
-        result = query_text_rag(question, top_k=top_k, source_filter=source_filter, chat_history=history)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+@app.get(
+    "/sources",
+    dependencies=[Depends(require_api_key)],
+)
+async def get_sources():
     return {
-        "mode"    : "text_rag",
-        "question": question,
-        "answer"  : result["answer"],
-        "sources" : [
-            {
-                "file"      : c["source"],
-                "chunk"     : c["chunk_idx"] + 1,
-                "similarity": c["score"],
-                "preview"   : c["text"][:200].replace("\n", " "),
-            }
-            for c in result.get("chunks", [])
-        ],
+        "sources": list_sources(),
     }
 
 
-@app.post("/query/general", summary="Ask a general question question without any of the documents", dependencies=[Depends(require_api_key)])
-async def query_general_endpoint(
-    question : str = Form(..., description="Your general question"),
-    chat_history: str            = Form("[]", description="Previous chat messages as JSON"),
-):
-    """
-    GENERAL CHAT MODE:
-    Answers normal questions without requiring selected documents or RAG context.
-    """
-    try:
-        history = json.loads(chat_history)
-        result = query_general(question, chat_history=history)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get(
+    "/stats",
+    dependencies=[Depends(require_api_key)],
+)
+async def database_stats():
+    stats = get_stats()
 
     return {
-        "mode" : "general_chat",
-        "question" : question,
-        "answer" : result["answer"],
-        "sources" : [],
-    }
-
-# ── POST /query/vlm ───────────────────────────────────────────
-@app.post("/query/vlm", summary="Analyze an artwork image with LLaVA",
-          dependencies=[Depends(require_api_key)])
-async def query_vlm(
-    question: str        = Form(..., description="Your question about the image"),
-    image   : UploadFile = File(..., description="Artwork image (jpg, png, etc.)"),
-):
-    """
-    VLM-ONLY MODE:
-    Passes the image directly to LLaVA. No text retrieval.
-    Best for visual analysis, style description, composition.
-    """
-    tmp_path = os.path.join(
-        tempfile.gettempdir(), f"vlm_{image.filename}"
-    )
-    with open(tmp_path, "wb") as f:
-        shutil.copyfileobj(image.file, f)
-
-    try:
-        result = query_vlm_only(question, tmp_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        os.remove(tmp_path)
-
-    return {
-        "mode"    : "vlm_only",
-        "question": question,
-        "answer"  : result["answer"],
+        "total_chunks": stats["total_chunks"],
+        "sources": stats["sources"],
+        "embedding_model": "gemini-embedding-001",
+        "embedding_dimensions": 384,
     }
 
 
-# ── POST /query/hybrid ────────────────────────────────────────
-@app.post("/query/hybrid", summary="Analyze image + retrieved text chunks together",
-          dependencies=[Depends(require_api_key)])
-async def query_hybrid_endpoint(
-    question     : str           = Form(...,  description="Your research question"),
-    image        : UploadFile    = File(...,  description="Artwork image"),
-    top_k        : int           = Form(3,    description="Number of chunks to retrieve"),
-    source_filter: Optional[str] = Form(None, description="Limit to one PDF filename"),
-):
-    """
-    HYBRID MODE:
-    LLaVA sees both the artwork image AND the relevant PDF chunks.
-    Most powerful mode for connecting visual art to research literature.
-    """
-    tmp_path = os.path.join(
-        tempfile.gettempdir(), f"hybrid_{image.filename}"
-    )
-    with open(tmp_path, "wb") as f:
-        shutil.copyfileobj(image.file, f)
+@app.delete(
+    "/source/{source_name}",
+    dependencies=[Depends(require_api_key)],
+)
+async def delete_source(source_name: str):
+    deleted = db_delete_source(source_name)
 
-    try:
-        result = query_hybrid(
-            question, tmp_path,
-            top_k=top_k,
-            source_filter=source_filter,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        os.remove(tmp_path)
-
-    return {
-        "mode"    : "hybrid",
-        "question": question,
-        "answer"  : result["answer"],
-        "sources" : [
-            {
-                "file"      : c["source"],
-                "chunk"     : c["chunk_idx"] + 1,
-                "similarity": c["score"],
-                "preview"   : c["text"][:200].replace("\n", " "),
-            }
-            for c in result.get("chunks", [])
-        ],
-    }
-
-
-# ── GET /sources ──────────────────────────────────────────────
-@app.get("/sources", summary="List all ingested PDF filenames",
-         dependencies=[Depends(require_api_key)])
-async def sources():
-    return {"sources": list_sources()}
-
-
-# ── GET /stats ────────────────────────────────────────────────
-@app.get("/stats", summary="Database statistics",
-         dependencies=[Depends(require_api_key)])
-async def stats():
-    s = get_stats()
-    return {
-        "total_chunks": s["total_chunks"],
-        "sources"     : s["sources"],
-        "database"    : "PostgreSQL 16 + pgvector 0.8.2",
-    }
-
-
-# ── DELETE /source/{name} ─────────────────────────────────────
-@app.delete("/source/{source_name}", summary="Remove a PDF from the database",
-            dependencies=[Depends(require_api_key)])
-async def delete_source_endpoint(source_name: str):
-    """
-    Deletes all chunks for the given PDF filename.
-    Example: DELETE /source/Sigmund.pdf
-    """
-    deleted = db_delete(source_name)
     if deleted == 0:
         raise HTTPException(
             status_code=404,
-            detail=f"'{source_name}' not found in database.",
+            detail=f"Source '{source_name}' was not found.",
         )
+
     return {
-        "status" : "deleted",
-        "source" : source_name,
-        "removed": deleted,
+        "status": "deleted",
+        "source": source_name,
+        "chunks_removed": deleted,
     }
 
 
-# ── POST /ingest/image ────────────────────────────────────────
-@app.post("/ingest/image", summary="Upload an artwork image — LLaVA describes it",
-          dependencies=[Depends(require_api_key)])
-async def ingest_image_endpoint(
-    image        : UploadFile    = File(..., description="Artwork image (jpg, png, etc.)"),
-    custom_prompt: Optional[str] = Form(None, description="Override the default art description prompt"),
-):
-    """
-    IMAGE INGESTION PIPELINE:
-    1. Saves the image to artwork_store/
-    2. LLaVA generates a detailed art-history description
-    3. BGE embeds the description
-    4. Stores filename + description + embedding in PostgreSQL
-
-    Re-uploading the same filename replaces the old record.
-    """
-    tmp_path = os.path.join(tempfile.gettempdir(), f"ingest_{image.filename}")
-    with open(tmp_path, "wb") as f:
-        shutil.copyfileobj(image.file, f)
-
-    try:
-        result = ingest_image(tmp_path, custom_prompt=custom_prompt)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    return {
-        "status"     : "ok",
-        "id"         : result["id"],
-        "filename"   : result["filename"],
-        "description": result["description"],
-    }
-
-
-# ── GET /images ───────────────────────────────────────────────
-@app.get("/images", summary="List all ingested artwork images",
-         dependencies=[Depends(require_api_key)])
-async def get_images():
-    """Return all artwork images stored in the database."""
-    artworks = list_artworks()
-    return {
-        "total"   : len(artworks),
-        "artworks": [
-            {
-                "id"         : a["id"],
-                "filename"   : a["filename"],
-                "description": a["description"][:200] + "...",
-                "created_at" : str(a["created_at"]),
-            }
-            for a in artworks
-        ],
-    }
-
-
-# ── POST /query/images ────────────────────────────────────────
-@app.post("/query/images", summary="Search artwork images by text query",
-          dependencies=[Depends(require_api_key)])
-async def query_images(
-    query: str = Form(..., description="Describe what you are looking for"),
-    top_k: int = Form(3,   description="Number of results to return"),
-):
-    """
-    IMAGE SEARCH MODE:
-    Embed the text query with BGE and find the most semantically
-    similar artwork images based on their LLaVA descriptions.
-
-    Example queries:
-      - "dark surrealist painting with distorted figures"
-      - "portrait of a woman with melancholic expression"
-      - "landscape with dramatic storm clouds"
-    """
-    try:
-        results = search_images(query, top_k=top_k)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not results:
-        return {"query": query, "results": [], "message": "No artworks ingested yet."}
-
-    return {
-        "query"  : query,
-        "results": [
-            {
-                "filename"   : r["filename"],
-                "similarity" : round(float(r["score"]), 4),
-                "description": r["description"],
-            }
-            for r in results
-        ],
-    }
-
-
-# ── DELETE /image/{filename} ──────────────────────────────────
-@app.delete("/image/{filename}", summary="Remove an artwork image from the database",
-            dependencies=[Depends(require_api_key)])
-async def delete_image_endpoint(filename: str):
-    """
-    Deletes the artwork record from PostgreSQL.
-    Example: DELETE /image/starry_night.jpg
-    """
-    deleted = db_delete_artwork(filename)
-    if deleted == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"'{filename}' not found in database.",
-        )
-    return {
-        "status"  : "deleted",
-        "filename": filename,
-    }
-
-
-# ── Run ───────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.getenv("PORT", "8000"))
+
+    uvicorn.run(
+        "api:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+    )

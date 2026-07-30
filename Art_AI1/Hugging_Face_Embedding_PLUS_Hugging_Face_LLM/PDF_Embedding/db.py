@@ -21,7 +21,7 @@ DB_CONFIG = {
     "password": os.getenv("PG_PASS", "Shenglingl@0606"),
 }
 
-EMBEDDING_DIM = 384   # BAAI/bge-small-en-v1.5 output dimension
+EMBEDDING_DIM = 384   # Gemini Embedding output dimension
 
 
 # ── Connection helper ─────────────────────────────────────────
@@ -33,7 +33,7 @@ def get_conn():
 # ── Schema setup ──────────────────────────────────────────────
 def init_db():
     """
-    Create the pdf_chunks table and indexes if they don't exist.
+    Create the pdf_chunks_gemini table and indexes if they don't exist.
     Safe to call multiple times (uses IF NOT EXISTS).
     """
     conn = get_conn()
@@ -45,7 +45,7 @@ def init_db():
 
             # Main chunks table
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS pdf_chunks (
+                CREATE TABLE IF NOT EXISTS pdf_chunks_gemini (
                     id          SERIAL       PRIMARY KEY,
                     source      VARCHAR(500) NOT NULL,
                     chunk_index INTEGER      NOT NULL,
@@ -57,14 +57,14 @@ def init_db():
 
             # Fast lookup by PDF filename
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chunks_source
-                ON pdf_chunks (source);
+                CREATE INDEX IF NOT EXISTS idx_gemini_chunks_source
+                ON pdf_chunks_gemini (source);
             """)
 
             # HNSW vector index — cosine similarity, works on empty tables
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-                ON pdf_chunks USING hnsw (embedding vector_cosine_ops);
+                CREATE INDEX IF NOT EXISTS idx_gemini_chunks_embedding
+                ON pdf_chunks_gemini USING hnsw (embedding vector_cosine_ops);
             """)
 
             # ── Artwork images table ──────────────────────────────
@@ -105,7 +105,7 @@ def insert_chunks(
     try:
         with conn.cursor() as cur:
             # Clean old data for this source
-            cur.execute("DELETE FROM pdf_chunks WHERE source = %s;", (source,))
+            cur.execute("DELETE FROM pdf_chunks_gemini WHERE source = %s;", (source,))
 
             # Bulk insert
             rows = [
@@ -116,7 +116,7 @@ def insert_chunks(
             execute_values(
                 cur,
                 """
-                INSERT INTO pdf_chunks (source, chunk_index, content, embedding)
+                INSERT INTO pdf_chunks_gemini (source, chunk_index, content, embedding)
                 VALUES %s
                 """,
                 rows,
@@ -145,7 +145,7 @@ def search_chunks(
                     """
                     SELECT source, chunk_index, content,
                            1 - (embedding <=> %s::vector) AS score
-                    FROM   pdf_chunks
+                    FROM   pdf_chunks_gemini
                     WHERE  source = %s
                     ORDER  BY embedding <=> %s::vector
                     LIMIT  %s;
@@ -157,7 +157,7 @@ def search_chunks(
                     """
                     SELECT source, chunk_index, content,
                            1 - (embedding <=> %s::vector) AS score
-                    FROM   pdf_chunks
+                    FROM   pdf_chunks_gemini
                     ORDER  BY embedding <=> %s::vector
                     LIMIT  %s;
                     """,
@@ -174,7 +174,7 @@ def list_sources() -> List[str]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT source FROM pdf_chunks ORDER BY source;"
+                "SELECT DISTINCT source FROM pdf_chunks_gemini ORDER BY source;"
             )
             return [row[0] for row in cur.fetchall()]
     finally:
@@ -186,7 +186,7 @@ def get_stats() -> dict:
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM pdf_chunks;")
+            cur.execute("SELECT COUNT(*) FROM pdf_chunks_gemini;")
             total = cur.fetchone()[0]
         return {"total_chunks": total, "sources": list_sources()}
     finally:
@@ -199,7 +199,7 @@ def delete_source(source_name: str) -> int:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM pdf_chunks WHERE source = %s;", (source_name,)
+                "DELETE FROM pdf_chunks_gemini WHERE source = %s;", (source_name,)
             )
             deleted = cur.rowcount
         conn.commit()
