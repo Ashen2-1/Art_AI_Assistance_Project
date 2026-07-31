@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import hmac
 
+from starlette.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -186,72 +187,60 @@ async def query_text_endpoint(
     }
 
 
-@app.post(
-    "/ingest",
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/ingest",summary="Upload a PDF and ingest it into the database",dependencies=[Depends(require_api_key)],)
 async def ingest_document(
     file: UploadFile = File(...),
     ocr_mode: str = Form("printed"),
 ):
-    original_name = Path(file.filename or "document.pdf").name
+    original_filename = Path(file.filename or "uploaded.pdf").name
 
-    if not original_name.lower().endswith(".pdf"):
+    if not original_filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are currently accepted.",
+            detail="Only PDF files are accepted.",
         )
 
-    if ocr_mode != "printed":
+    if ocr_mode not in ("printed", "cursive"):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Only printed OCR is available in the current "
-                "lightweight deployment."
-            ),
+            detail="ocr_mode must be 'printed' or 'cursive'.",
         )
-
-    temporary_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".pdf",
-        ) as temporary_file:
-            temporary_path = temporary_file.name
-            shutil.copyfileobj(file.file, temporary_file)
+        with tempfile.TemporaryDirectory(prefix="nexo_ingest_") as temp_dir:
+            # 临时目录是随机的，但文件本身保留用户上传的原文件名
+            tmp_path = Path(temp_dir) / original_filename
 
-        chunks_added = ingest_pdf(
-            temporary_path,
-            ocr_mode=ocr_mode,
-            source_name=original_name,
-        )
-    except TypeError:
-        # Compatibility with the current ingest_pdf signature.
-        chunks_added = ingest_pdf(
-            temporary_path,
-            ocr_mode=ocr_mode,
-        )
+            file_content = await file.read()
+            tmp_path.write_bytes(file_content)
+
+            # 放进工作线程，避免阻塞 FastAPI 的 /health
+            chunks_added = await run_in_threadpool(
+                ingest_pdf,
+                str(tmp_path),
+                ocr_mode=ocr_mode,
+            )
+
+        stats = get_stats()
+
+        return {
+            "status": "ok",
+            "file": original_filename,
+            "chunks_added": chunks_added,
+            "db_total": stats["total_chunks"],
+            "sources": stats["sources"],
+        }
+
+    except HTTPException:
+        raise
+
     except Exception as error:
-        print(f"[INGEST ERROR] {error}")
+        print(f"[INGEST ERROR] {type(error).__name__}: {error}")
+
         raise HTTPException(
             status_code=500,
             detail=f"Document ingestion failed: {error}",
         )
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.remove(temporary_path)
-
-    stats = get_stats()
-
-    return {
-        "status": "ok",
-        "file": original_name,
-        "chunks_added": chunks_added,
-        "database_total": stats["total_chunks"],
-        "sources": stats["sources"],
-    }
-
 
 @app.get(
     "/sources",
