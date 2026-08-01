@@ -175,14 +175,31 @@ async def query_text_endpoint(
         "mode": "text_rag",
         "question": question,
         "answer": result["answer"],
-        "sources": [
+        "citations": [
             {
+                "id": index + 1,
                 "file": chunk["source"],
                 "chunk": chunk["chunk_idx"] + 1,
+                "page": chunk.get("page") or chunk.get("page_number"),
                 "similarity": round(float(chunk["score"]), 4),
                 "preview": chunk["text"][:300].replace("\n", " "),
+                "text": chunk["text"],
             }
-            for chunk in result.get("chunks", [])
+            for index, chunk in enumerate(result.get("chunks", []))
+        ],
+
+        # 暂时保留 sources，避免现有 Node 和 React 前端坏掉
+        "sources": [
+            {
+                "id": index + 1,
+                "file": chunk["source"],
+                "chunk": chunk["chunk_idx"] + 1,
+                "page": chunk.get("page") or chunk.get("page_number"),
+                "similarity": round(float(chunk["score"]), 4),
+                "preview": chunk["text"][:300].replace("\n", " "),
+                "text": chunk["text"],
+            }
+            for index, chunk in enumerate(result.get("chunks", []))
         ],
     }
 
