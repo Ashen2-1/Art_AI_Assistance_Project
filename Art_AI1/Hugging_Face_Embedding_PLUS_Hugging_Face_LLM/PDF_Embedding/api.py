@@ -271,13 +271,18 @@ async def query_text_endpoint(
     question: str = Form(...),
     user_id: str = Form(...),
     canvas_id: str = Form("default"),
-    top_k: int = Form(3),
-    source_filters: str = Form("[]"),
+    top_k: int = Form(5),
     source_filter: Optional[str] = Form(None),
     chat_history: str = Form("[]"),
 ):
+    history = parse_chat_history(chat_history)
+
     safe_user_id = user_id.strip()
-    safe_canvas_id = canvas_id.strip() or "default"
+    safe_canvas_id = (
+        str(canvas_id or "default").strip()
+        or "default"
+    )
+    safe_top_k = max(1, min(top_k, 10))
 
     if not safe_user_id:
         raise HTTPException(
@@ -285,17 +290,12 @@ async def query_text_endpoint(
             detail="user_id is required.",
         )
 
-    history = parse_chat_history(chat_history)
-    selected_sources = parse_source_filters(source_filters)
-    safe_top_k = max(1, min(top_k, 10))
-
     try:
         result = query_text_rag(
-            question=question,
+            question,
             user_id=safe_user_id,
             canvas_id=safe_canvas_id,
             top_k=safe_top_k,
-            source_filters=selected_sources,
             source_filter=source_filter,
             chat_history=history,
         )
@@ -309,7 +309,7 @@ async def query_text_endpoint(
 
         raise HTTPException(
             status_code=500,
-            detail="The RAG service could not answer the question.",
+            detail=f"The RAG service failed: {error}",
         )
 
     return {
@@ -318,27 +318,20 @@ async def query_text_endpoint(
         "answer": result["answer"],
         "sources": [
             {
-                "citation_id": chunk.get(
-                    "citation_id",
-                    index + 1,
-                ),
                 "file": chunk["source"],
                 "chunk": chunk["chunk_idx"] + 1,
                 "similarity": round(
                     float(chunk["score"]),
                     4,
                 ),
-                "preview": chunk["text"][:500].replace(
+                "preview": chunk["text"][:300].replace(
                     "\n",
                     " ",
                 ),
             }
-            for index, chunk in enumerate(
-                result.get("chunks", [])
-            )
+            for chunk in result.get("chunks", [])
         ],
     }
-
 
 @app.post(
     "/ingest",
