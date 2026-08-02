@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 # ── Connection config (override via environment variables) ────
 DB_CONFIG = {
     "host"    : os.getenv("PG_HOST", "localhost"),
@@ -26,7 +27,16 @@ EMBEDDING_DIM = 384   # Gemini Embedding output dimension
 
 # ── Connection helper ─────────────────────────────────────────
 def get_conn():
-    """Open and return a new psycopg2 connection."""
+    """Open a PostgreSQL connection."""
+
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL)
+
+    if not DB_CONFIG["password"]:
+        raise RuntimeError(
+            "Database password is missing. Configure DATABASE_URL or PG_PASS."
+        )
+
     return psycopg2.connect(**DB_CONFIG)
 
 
@@ -52,6 +62,28 @@ def init_db():
                     content     TEXT         NOT NULL,
                     embedding   vector({EMBEDDING_DIM}),
                     created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Upgrade existing databases without deleting existing rows.
+            cur.execute("""
+                ALTER TABLE pdf_chunks_gemini
+                ADD COLUMN IF NOT EXISTS user_id TEXT
+                NOT NULL DEFAULT '__legacy__';
+            """)
+
+            cur.execute("""
+                ALTER TABLE pdf_chunks_gemini
+                ADD COLUMN IF NOT EXISTS canvas_id TEXT
+                NOT NULL DEFAULT 'default';
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_gemini_chunks_tenant_source
+                ON pdf_chunks_gemini (
+                    user_id,
+                    canvas_id,
+                    source
                 );
             """)
 
@@ -95,115 +127,298 @@ def insert_chunks(
     source: str,
     chunks: List[str],
     embeddings: List[List[float]],
+    user_id: str,
+    canvas_id: str = "default",
 ) -> int:
     """
-    Insert a batch of chunks + embeddings for one PDF source.
-    Replaces any existing rows for the same source first.
-    Returns number of rows inserted.
+    Store chunks belonging to one user and one canvas.
+
+    Re-uploading the same filename only replaces that user's
+    copy inside the same canvas.
     """
+
+    if not user_id:
+        raise ValueError("user_id is required when inserting chunks.")
+
+    safe_canvas_id = canvas_id or "default"
+
     conn = get_conn()
+
     try:
         with conn.cursor() as cur:
-            # Clean old data for this source
-            cur.execute("DELETE FROM pdf_chunks_gemini WHERE source = %s;", (source,))
+            cur.execute(
+                """
+                DELETE FROM pdf_chunks_gemini
+                WHERE user_id = %s
+                  AND canvas_id = %s
+                  AND source = %s;
+                """,
+                (
+                    user_id,
+                    safe_canvas_id,
+                    source,
+                ),
+            )
 
-            # Bulk insert
             rows = [
-                (source, i, chunk, embeddings[i])
-                for i, chunk in enumerate(chunks)
+                (
+                    user_id,
+                    safe_canvas_id,
+                    source,
+                    index,
+                    chunk,
+                    embeddings[index],
+                )
+                for index, chunk in enumerate(chunks)
             ]
+
             from psycopg2.extras import execute_values
+
             execute_values(
                 cur,
                 """
-                INSERT INTO pdf_chunks_gemini (source, chunk_index, content, embedding)
+                INSERT INTO pdf_chunks_gemini (
+                    user_id,
+                    canvas_id,
+                    source,
+                    chunk_index,
+                    content,
+                    embedding
+                )
                 VALUES %s
                 """,
                 rows,
-                template="(%s, %s, %s, %s::vector)",
+                template="(%s, %s, %s, %s, %s, %s::vector)",
             )
+
         conn.commit()
         return len(rows)
+
     finally:
         conn.close()
 
 
 def search_chunks(
     query_embedding: List[float],
+    user_id: str,
+    canvas_id: str = "default",
     top_k: int = 3,
-    source_filter: Optional[str] = None,
+    source_filters: Optional[List[str]] = None,
 ) -> List[dict]:
     """
-    Cosine similarity search via pgvector (<=> operator).
-    Returns top_k closest chunks as list of dicts.
+    Search only inside one user's canvas.
+
+    source_filters supports one or multiple selected files.
     """
+
+    if not user_id:
+        raise ValueError("user_id is required when searching chunks.")
+
+    safe_canvas_id = canvas_id or "default"
+
+    cleaned_sources = [
+        str(source).strip()
+        for source in (source_filters or [])
+        if str(source).strip()
+    ]
+
     conn = get_conn()
+
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if source_filter:
+        with conn.cursor(
+            cursor_factory=RealDictCursor
+        ) as cur:
+            if cleaned_sources:
                 cur.execute(
                     """
-                    SELECT source, chunk_index, content,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM   pdf_chunks_gemini
-                    WHERE  source = %s
-                    ORDER  BY embedding <=> %s::vector
-                    LIMIT  %s;
+                    SELECT
+                        source,
+                        chunk_index,
+                        content,
+                        1 - (
+                            embedding <=> %s::vector
+                        ) AS score
+                    FROM pdf_chunks_gemini
+                    WHERE user_id = %s
+                      AND canvas_id = %s
+                      AND source = ANY(%s)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
                     """,
-                    (query_embedding, source_filter, query_embedding, top_k),
+                    (
+                        query_embedding,
+                        user_id,
+                        safe_canvas_id,
+                        cleaned_sources,
+                        query_embedding,
+                        top_k,
+                    ),
                 )
             else:
                 cur.execute(
                     """
-                    SELECT source, chunk_index, content,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM   pdf_chunks_gemini
-                    ORDER  BY embedding <=> %s::vector
-                    LIMIT  %s;
+                    SELECT
+                        source,
+                        chunk_index,
+                        content,
+                        1 - (
+                            embedding <=> %s::vector
+                        ) AS score
+                    FROM pdf_chunks_gemini
+                    WHERE user_id = %s
+                      AND canvas_id = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
                     """,
-                    (query_embedding, query_embedding, top_k),
+                    (
+                        query_embedding,
+                        user_id,
+                        safe_canvas_id,
+                        query_embedding,
+                        top_k,
+                    ),
                 )
-            return [dict(row) for row in cur.fetchall()]
+
+            return [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
     finally:
         conn.close()
 
 
-def list_sources() -> List[str]:
-    """Return all unique PDF filenames stored in the DB."""
+def list_sources(
+    user_id: str,
+    canvas_id: str = "default",
+) -> List[str]:
+    """Return sources belonging only to one user's canvas."""
+
+    if not user_id:
+        raise ValueError("user_id is required when listing sources.")
+
+    safe_canvas_id = canvas_id or "default"
+
     conn = get_conn()
+
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT source FROM pdf_chunks_gemini ORDER BY source;"
+                """
+                SELECT DISTINCT source
+                FROM pdf_chunks_gemini
+                WHERE user_id = %s
+                  AND canvas_id = %s
+                ORDER BY source;
+                """,
+                (
+                    user_id,
+                    safe_canvas_id,
+                ),
             )
-            return [row[0] for row in cur.fetchall()]
+
+            return [
+                row[0]
+                for row in cur.fetchall()
+            ]
+
     finally:
         conn.close()
 
 
-def get_stats() -> dict:
-    """Return total chunk count and list of ingested sources."""
+def get_stats(
+    user_id: str,
+    canvas_id: str = "default",
+) -> dict:
+    """Return statistics only for one user's canvas."""
+
+    if not user_id:
+        raise ValueError("user_id is required when getting stats.")
+
+    safe_canvas_id = canvas_id or "default"
+
     conn = get_conn()
+
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM pdf_chunks_gemini;")
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM pdf_chunks_gemini
+                WHERE user_id = %s
+                  AND canvas_id = %s;
+                """,
+                (
+                    user_id,
+                    safe_canvas_id,
+                ),
+            )
+
             total = cur.fetchone()[0]
-        return {"total_chunks": total, "sources": list_sources()}
+
+            cur.execute(
+                """
+                SELECT DISTINCT source
+                FROM pdf_chunks_gemini
+                WHERE user_id = %s
+                  AND canvas_id = %s
+                ORDER BY source;
+                """,
+                (
+                    user_id,
+                    safe_canvas_id,
+                ),
+            )
+
+            sources = [
+                row[0]
+                for row in cur.fetchall()
+            ]
+
+            return {
+                "total_chunks": total,
+                "sources": sources,
+            }
+
     finally:
         conn.close()
 
 
-def delete_source(source_name: str) -> int:
-    """Delete all chunks for a given PDF. Returns rows deleted."""
+def delete_source(
+    source_name: str,
+    user_id: str,
+    canvas_id: str = "default",
+) -> int:
+    """Delete a source only from one user's canvas."""
+
+    if not user_id:
+        raise ValueError("user_id is required when deleting a source.")
+
+    safe_canvas_id = canvas_id or "default"
+
     conn = get_conn()
+
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM pdf_chunks_gemini WHERE source = %s;", (source_name,)
+                """
+                DELETE FROM pdf_chunks_gemini
+                WHERE source = %s
+                  AND user_id = %s
+                  AND canvas_id = %s;
+                """,
+                (
+                    source_name,
+                    user_id,
+                    safe_canvas_id,
+                ),
             )
+
             deleted = cur.rowcount
+
         conn.commit()
         return deleted
+
     finally:
         conn.close()
 
@@ -301,6 +516,23 @@ def delete_artwork(filename: str) -> int:
 # ── CLI test ──────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
-    stats = get_stats()
+
+    cli_user_id = os.getenv(
+        "NEXO_CLI_USER_ID",
+        "local-cli",
+    )
+
+    cli_canvas_id = os.getenv(
+        "NEXO_CLI_CANVAS_ID",
+        "default",
+    )
+
+    stats = get_stats(
+        user_id=cli_user_id,
+        canvas_id=cli_canvas_id,
+    )
+
+    print(f"User         : {cli_user_id}")
+    print(f"Canvas       : {cli_canvas_id}")
     print(f"Total chunks : {stats['total_chunks']}")
     print(f"Sources      : {stats['sources'] or 'none'}")

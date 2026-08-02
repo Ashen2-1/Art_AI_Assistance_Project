@@ -1,13 +1,11 @@
+import hmac
 import json
 import os
-import shutil
 import tempfile
-import hmac
 
-from starlette.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import (
@@ -16,10 +14,12 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Security,
     UploadFile,
 )
 from fastapi.security.api_key import APIKeyHeader
+from starlette.concurrency import run_in_threadpool
 import uvicorn
 
 from db import (
@@ -64,6 +64,25 @@ def require_api_key(
     return provided_key
 
 
+def normalize_identity(
+    user_id: str,
+    canvas_id: str = "default",
+):
+    safe_user_id = str(user_id or "").strip()
+    safe_canvas_id = (
+        str(canvas_id or "default").strip()
+        or "default"
+    )
+
+    if not safe_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required.",
+        )
+
+    return safe_user_id, safe_canvas_id
+
+
 def parse_chat_history(chat_history: str):
     try:
         history = json.loads(chat_history)
@@ -79,18 +98,114 @@ def parse_chat_history(chat_history: str):
             detail="chat_history must be a JSON array.",
         )
 
-    return history
+    cleaned_history = []
+
+    for message in history[-12:]:
+        if not isinstance(message, dict):
+            continue
+
+        role = str(
+            message.get("role", "user")
+        ).strip()
+
+        content = str(
+            message.get("content", "")
+        ).strip()
+
+        if not content:
+            continue
+
+        cleaned_history.append(
+            {
+                "role": role,
+                "content": content[:6000],
+            }
+        )
+
+    return cleaned_history
+
+def parse_source_filters(source_filters: str):
+    if not source_filters:
+        return []
+
+    try:
+        parsed = json.loads(source_filters)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="source_filters must be valid JSON.",
+        )
+
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=400,
+            detail="source_filters must be a JSON array.",
+        )
+
+    cleaned = []
+    seen = set()
+
+    for source in parsed:
+        source_name = str(source).strip()
+
+        if source_name and source_name not in seen:
+            seen.add(source_name)
+            cleaned.append(source_name)
+
+    return cleaned
+
+def parse_source_filters(
+    source_filters: str,
+    source_filter: Optional[str] = None,
+) -> List[str]:
+    try:
+        parsed_filters = json.loads(
+            source_filters or "[]"
+        )
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="source_filters must be a valid JSON array.",
+        )
+
+    if not isinstance(parsed_filters, list):
+        raise HTTPException(
+            status_code=400,
+            detail="source_filters must be a JSON array.",
+        )
+
+    candidates = list(parsed_filters)
+
+    # Temporary support for the old single-source parameter.
+    if source_filter:
+        candidates.append(source_filter)
+
+    cleaned_sources = []
+    seen_sources = set()
+
+    for source in candidates:
+        normalized_source = str(source).strip()
+
+        if (
+            normalized_source
+            and normalized_source not in seen_sources
+        ):
+            seen_sources.add(normalized_source)
+            cleaned_sources.append(normalized_source)
+
+    return cleaned_sources
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not API_KEY:
         raise RuntimeError(
-            "API_KEY is missing. Add API_KEY to the Python .env file."
+            "API_KEY is missing. Add API_KEY to the Python environment."
         )
 
     init_db()
     print("[NEXO RAG API] Database ready.")
+
     yield
 
 
@@ -98,10 +213,9 @@ app = FastAPI(
     title="NEXO Multidisciplinary RAG API",
     description=(
         "Document ingestion and grounded AI research assistance "
-        "for arts, humanities, engineering, mathematics, science, "
-        "and other research fields."
+        "for multidisciplinary research fields."
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -125,12 +239,17 @@ async def query_general_endpoint(
     history = parse_chat_history(chat_history)
 
     try:
-        result = query_general(
+        result = await run_in_threadpool(
+            query_general,
             question,
-            chat_history=history,
+            history,
         )
     except Exception as error:
-        print(f"[GENERAL QUERY ERROR] {error}")
+        print(
+            f"[GENERAL QUERY ERROR] "
+            f"{type(error).__name__}: {error}"
+        )
+
         raise HTTPException(
             status_code=500,
             detail="The AI service could not answer the question.",
@@ -150,22 +269,44 @@ async def query_general_endpoint(
 )
 async def query_text_endpoint(
     question: str = Form(...),
+    user_id: str = Form(...),
+    canvas_id: str = Form("default"),
     top_k: int = Form(3),
+    source_filters: str = Form("[]"),
     source_filter: Optional[str] = Form(None),
     chat_history: str = Form("[]"),
 ):
+    safe_user_id = user_id.strip()
+    safe_canvas_id = canvas_id.strip() or "default"
+
+    if not safe_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required.",
+        )
+
     history = parse_chat_history(chat_history)
+    selected_sources = parse_source_filters(source_filters)
     safe_top_k = max(1, min(top_k, 10))
 
     try:
         result = query_text_rag(
-            question,
+            question=question,
+            user_id=safe_user_id,
+            canvas_id=safe_canvas_id,
             top_k=safe_top_k,
+            source_filters=selected_sources,
             source_filter=source_filter,
             chat_history=history,
         )
     except Exception as error:
-        print(f"[TEXT RAG ERROR] {error}")
+        print(
+            f"[TEXT RAG ERROR] "
+            f"user={safe_user_id} "
+            f"canvas={safe_canvas_id} "
+            f"{type(error).__name__}: {error}"
+        )
+
         raise HTTPException(
             status_code=500,
             detail="The RAG service could not answer the question.",
@@ -175,46 +316,58 @@ async def query_text_endpoint(
         "mode": "text_rag",
         "question": question,
         "answer": result["answer"],
-        "citations": [
-            {
-                "id": index + 1,
-                "file": chunk["source"],
-                "chunk": chunk["chunk_idx"] + 1,
-                "page": chunk.get("page") or chunk.get("page_number"),
-                "similarity": round(float(chunk["score"]), 4),
-                "preview": chunk["text"][:300].replace("\n", " "),
-                "text": chunk["text"],
-            }
-            for index, chunk in enumerate(result.get("chunks", []))
-        ],
-
-        # 暂时保留 sources，避免现有 Node 和 React 前端坏掉
         "sources": [
             {
-                "id": index + 1,
+                "citation_id": chunk.get(
+                    "citation_id",
+                    index + 1,
+                ),
                 "file": chunk["source"],
                 "chunk": chunk["chunk_idx"] + 1,
-                "page": chunk.get("page") or chunk.get("page_number"),
-                "similarity": round(float(chunk["score"]), 4),
-                "preview": chunk["text"][:300].replace("\n", " "),
-                "text": chunk["text"],
+                "similarity": round(
+                    float(chunk["score"]),
+                    4,
+                ),
+                "preview": chunk["text"][:500].replace(
+                    "\n",
+                    " ",
+                ),
             }
-            for index, chunk in enumerate(result.get("chunks", []))
+            for index, chunk in enumerate(
+                result.get("chunks", [])
+            )
         ],
     }
 
 
-@app.post("/ingest",summary="Upload a PDF and ingest it into the database",dependencies=[Depends(require_api_key)],)
+@app.post(
+    "/ingest",
+    summary="Upload and index a PDF document",
+    dependencies=[Depends(require_api_key)],
+)
 async def ingest_document(
     file: UploadFile = File(...),
+    user_id: str = Form(...),
+    canvas_id: str = Form("default"),
     ocr_mode: str = Form("printed"),
 ):
-    original_filename = Path(file.filename or "uploaded.pdf").name
+    safe_user_id = user_id.strip()
+    safe_canvas_id = canvas_id.strip() or "default"
+
+    if not safe_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required.",
+        )
+
+    original_filename = Path(
+        file.filename or "uploaded.pdf"
+    ).name
 
     if not original_filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are accepted.",
+            detail="Only PDF files are currently accepted for AI indexing.",
         )
 
     if ocr_mode not in ("printed", "cursive"):
@@ -224,25 +377,32 @@ async def ingest_document(
         )
 
     try:
-        with tempfile.TemporaryDirectory(prefix="nexo_ingest_") as temp_dir:
-            # 临时目录是随机的，但文件本身保留用户上传的原文件名
+        with tempfile.TemporaryDirectory(
+            prefix="nexo_ingest_"
+        ) as temp_dir:
             tmp_path = Path(temp_dir) / original_filename
 
             file_content = await file.read()
             tmp_path.write_bytes(file_content)
 
-            # 放进工作线程，避免阻塞 FastAPI 的 /health
             chunks_added = await run_in_threadpool(
                 ingest_pdf,
                 str(tmp_path),
-                ocr_mode=ocr_mode,
+                safe_user_id,
+                safe_canvas_id,
+                ocr_mode,
             )
 
-        stats = get_stats()
+        stats = get_stats(
+            user_id=safe_user_id,
+            canvas_id=safe_canvas_id,
+        )
 
         return {
             "status": "ok",
             "file": original_filename,
+            "user_id": safe_user_id,
+            "canvas_id": safe_canvas_id,
             "chunks_added": chunks_added,
             "db_total": stats["total_chunks"],
             "sources": stats["sources"],
@@ -252,7 +412,12 @@ async def ingest_document(
         raise
 
     except Exception as error:
-        print(f"[INGEST ERROR] {type(error).__name__}: {error}")
+        print(
+            f"[INGEST ERROR] "
+            f"user={safe_user_id} "
+            f"canvas={safe_canvas_id} "
+            f"{type(error).__name__}: {error}"
+        )
 
         raise HTTPException(
             status_code=500,
@@ -263,9 +428,15 @@ async def ingest_document(
     "/sources",
     dependencies=[Depends(require_api_key)],
 )
-async def get_sources():
+async def get_sources(
+    user_id: str,
+    canvas_id: str = "default",
+):
     return {
-        "sources": list_sources(),
+        "sources": list_sources(
+            user_id=user_id,
+            canvas_id=canvas_id,
+        ),
     }
 
 
@@ -273,8 +444,14 @@ async def get_sources():
     "/stats",
     dependencies=[Depends(require_api_key)],
 )
-async def database_stats():
-    stats = get_stats()
+async def database_stats(
+    user_id: str,
+    canvas_id: str = "default",
+):
+    stats = get_stats(
+        user_id=user_id,
+        canvas_id=canvas_id,
+    )
 
     return {
         "total_chunks": stats["total_chunks"],
@@ -288,8 +465,44 @@ async def database_stats():
     "/source/{source_name}",
     dependencies=[Depends(require_api_key)],
 )
-async def delete_source(source_name: str):
-    deleted = db_delete_source(source_name)
+async def delete_source(
+    source_name: str,
+    user_id: str,
+    canvas_id: str = "default",
+):
+    deleted = db_delete_source(
+        source_name=source_name,
+        user_id=user_id,
+        canvas_id=canvas_id,
+    )
+
+    if deleted == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Source '{source_name}' was not found.",
+        )
+
+    return {
+        "status": "deleted",
+        "source": source_name,
+        "chunks_removed": deleted,
+    }
+
+async def delete_source(
+    source_name: str,
+    user_id: str = Query(...),
+    canvas_id: str = Query("default"),
+):
+    safe_user_id, safe_canvas_id = normalize_identity(
+        user_id,
+        canvas_id,
+    )
+
+    deleted = db_delete_source(
+        source_name=source_name,
+        user_id=safe_user_id,
+        canvas_id=safe_canvas_id,
+    )
 
     if deleted == 0:
         raise HTTPException(
@@ -305,7 +518,9 @@ async def delete_source(source_name: str):
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = int(
+        os.getenv("PORT", "8000")
+    )
 
     uvicorn.run(
         "api:app",

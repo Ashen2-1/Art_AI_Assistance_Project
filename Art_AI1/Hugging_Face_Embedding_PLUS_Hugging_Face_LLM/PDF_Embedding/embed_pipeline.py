@@ -101,6 +101,8 @@ def embed_texts(
 
 def ingest_pdf(
     pdf_path: str,
+    user_id: str,
+    canvas_id: str = "default",
     ocr_mode: str = "printed",
     chunk_size: int = CHUNK_SIZE,
     chunk_overlap: int = CHUNK_OVERLAP,
@@ -111,6 +113,14 @@ def ingest_pdf(
     Re-ingesting a PDF with the same filename replaces its
     existing Gemini chunks.
     """
+
+    if not user_id or not str(user_id).strip():
+        raise ValueError(
+            "user_id is required when ingesting a document."
+        )
+
+    safe_user_id = str(user_id).strip()
+    safe_canvas_id = str(canvas_id or "default").strip() or "default"
 
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(
@@ -167,9 +177,14 @@ def ingest_pdf(
         source=source_name,
         chunks=chunks,
         embeddings=embeddings,
+        user_id=safe_user_id,
+        canvas_id=safe_canvas_id,
     )
 
-    stats = get_stats()
+    stats = get_stats(
+        user_id=safe_user_id,
+        canvas_id=safe_canvas_id,
+    )
 
     print()
     print(
@@ -183,11 +198,32 @@ def ingest_pdf(
     return stored_count
 
 
-def get_db_stats() -> dict:
-    return get_stats()
+def get_db_stats(
+    user_id: str,
+    canvas_id: str = "default",
+) -> dict:
+    if not user_id or not str(user_id).strip():
+        raise ValueError(
+            "user_id is required when getting database stats."
+        )
+
+    return get_stats(
+        user_id=str(user_id).strip(),
+        canvas_id=str(canvas_id or "default").strip() or "default",
+    )
 
 
 if __name__ == "__main__":
+    cli_user_id = os.getenv(
+        "NEXO_CLI_USER_ID",
+        "local-cli",
+    )
+
+    cli_canvas_id = os.getenv(
+        "NEXO_CLI_CANVAS_ID",
+        "default",
+    )
+
     if len(sys.argv) < 2:
         print("Usage:")
         print(
@@ -205,7 +241,10 @@ if __name__ == "__main__":
     if sys.argv[1] == "--stats":
         init_db()
 
-        stats = get_db_stats()
+        stats = get_db_stats(
+            user_id=cli_user_id,
+            canvas_id=cli_canvas_id,
+        )
 
         print()
         print("Gemini PostgreSQL Stats")
@@ -228,11 +267,16 @@ if __name__ == "__main__":
     )
 
     count = ingest_pdf(
-        pdf_file,
+        pdf_path=pdf_file,
+        user_id=cli_user_id,
+        canvas_id=cli_canvas_id,
         ocr_mode=mode,
     )
 
-    stats = get_db_stats()
+    stats = get_db_stats(
+        user_id=cli_user_id,
+        canvas_id=cli_canvas_id,
+    )
 
     print()
     print("=" * 60)
