@@ -1,8 +1,10 @@
+########################## rag_query.py
 import os
 import sys
 import textwrap
 from pathlib import Path
 from typing import Optional, List
+import json
 
 # Ensure files in this folder can be imported
 sys.path.insert(0, str(Path(__file__).parent))
@@ -10,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from gemini_embedding import embed_query
 from db import search_chunks, get_stats
 from gemini_client import generate_text, generate_image
-
+from prompt_profiles import build_system_prompt
 
 TOP_K = 3
 
@@ -248,11 +250,54 @@ def query_text_rag(
     question: str,
     user_id: str,
     canvas_id: str = "default",
-    top_k: int = TOP_K,
-    source_filters: Optional[List[str]] = None,
-    source_filter: Optional[str] = None,
-    chat_history: list = None,
-) -> dict:
+    top_k: int = 5,
+    source_filters=None,
+    source_filter=None,
+    chat_history=None,
+):
+    safe_user_id = str(user_id or "").strip()
+
+    if not safe_user_id:
+        raise ValueError(
+            "user_id is required for text RAG."
+        )
+
+    safe_canvas_id = (
+        str(canvas_id or "default").strip()
+        or "default"
+    )
+
+    safe_top_k = max(
+        1,
+        min(int(top_k or 5), 10),
+    )
+
+    selected_sources = []
+
+    if isinstance(source_filters, list):
+        selected_sources.extend(source_filters)
+
+    elif isinstance(source_filters, str) and source_filters.strip():
+        try:
+            parsed_sources = json.loads(source_filters)
+
+            if isinstance(parsed_sources, list):
+                selected_sources.extend(parsed_sources)
+            else:
+                selected_sources.append(source_filters)
+        except json.JSONDecodeError:
+            selected_sources.append(source_filters)
+
+    if source_filter:
+        selected_sources.append(source_filter)
+
+    selected_sources = list(
+        dict.fromkeys(
+            str(source).strip()
+            for source in selected_sources
+            if str(source).strip()
+        )
+    )
     """
     Answer using only documents belonging to the current user
     and Canvas.
@@ -268,10 +313,9 @@ def query_text_rag(
     )
 
     chunks = retrieve(
-        question=question,
-        user_id=user_id,
-        canvas_id=canvas_id,
-        top_k=top_k,
+        top_k=safe_top_k,
+        user_id=safe_user_id,
+        canvas_id=safe_canvas_id,
         source_filters=selected_sources,
     )
 
@@ -351,6 +395,8 @@ Requirements:
 def query_general(
     question: str,
     chat_history: list = None,
+    domain: str = "auto",
+    task: str = "answer",
 ) -> dict:
     """
     General chat without document retrieval.

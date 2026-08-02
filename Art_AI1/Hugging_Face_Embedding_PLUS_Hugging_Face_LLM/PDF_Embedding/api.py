@@ -1,8 +1,10 @@
+############################api.py
 import hmac
 import json
 import os
 import tempfile
 
+from prompt_profiles import normalize_domain
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -124,6 +126,80 @@ def parse_chat_history(chat_history: str):
 
     return cleaned_history
 
+def parse_source_filters(
+    source_filters: str,
+    source_filter: Optional[str] = None,
+):
+    selected_sources = []
+
+    if source_filters:
+        try:
+            parsed_sources = json.loads(source_filters)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="source_filters must be valid JSON.",
+            )
+
+        if isinstance(parsed_sources, list):
+            selected_sources.extend(parsed_sources)
+        elif parsed_sources:
+            selected_sources.append(parsed_sources)
+
+    if source_filter:
+        selected_sources.append(source_filter)
+
+    normalized_sources = []
+
+    for source in selected_sources:
+        source_name = str(source).strip()
+
+        if (
+            source_name
+            and source_name not in normalized_sources
+        ):
+            normalized_sources.append(source_name)
+
+    return normalized_sources[:20]
+
+def parse_source_filters(
+    source_filters: str,
+    source_filter: Optional[str] = None,
+):
+    try:
+        parsed = json.loads(source_filters or "[]")
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="source_filters must be valid JSON.",
+        )
+
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=400,
+            detail="source_filters must be a JSON array.",
+        )
+
+    candidates = list(parsed)
+
+    # 兼容旧的单文档参数
+    if source_filter:
+        candidates.append(source_filter)
+
+    normalized = []
+
+    for source in candidates:
+        source_name = str(source).strip()
+
+        if (
+            source_name
+            and not source_name.startswith("__nexo_")
+            and source_name not in normalized
+        ):
+            normalized.append(source_name)
+
+    return normalized[:20]
+
 def parse_source_filters(source_filters: str):
     if not source_filters:
         return []
@@ -231,18 +307,22 @@ async def health():
 @app.post(
     "/query/general",
     dependencies=[Depends(require_api_key)],
+
 )
 async def query_general_endpoint(
     question: str = Form(...),
     chat_history: str = Form("[]"),
+    domain: str = Form("auto"),
+    task: str = Form("answer"),
 ):
     history = parse_chat_history(chat_history)
 
     try:
-        result = await run_in_threadpool(
-            query_general,
+        result = query_general(
             question,
-            history,
+            chat_history=history,
+            domain=domain,
+            task=task,
         )
     except Exception as error:
         print(
@@ -272,17 +352,20 @@ async def query_text_endpoint(
     user_id: str = Form(...),
     canvas_id: str = Form("default"),
     top_k: int = Form(5),
+    source_filters: str = Form("[]"),
     source_filter: Optional[str] = Form(None),
     chat_history: str = Form("[]"),
 ):
-    history = parse_chat_history(chat_history)
-
+    safe_question = question.strip()
     safe_user_id = user_id.strip()
-    safe_canvas_id = (
-        str(canvas_id or "default").strip()
-        or "default"
-    )
+    safe_canvas_id = canvas_id.strip() or "default"
     safe_top_k = max(1, min(top_k, 10))
+
+    if not safe_question:
+        raise HTTPException(
+            status_code=400,
+            detail="Question is required.",
+        )
 
     if not safe_user_id:
         raise HTTPException(
@@ -290,21 +373,29 @@ async def query_text_endpoint(
             detail="user_id is required.",
         )
 
+    history = parse_chat_history(chat_history)
+
+    selected_sources = parse_source_filters(
+        source_filters=source_filters,
+        source_filter=source_filter,
+    )
+
     try:
         result = query_text_rag(
-            question,
-            user_id=safe_user_id,
-            canvas_id=safe_canvas_id,
+            question=question,
+            user_id=user_id,
+            canvas_id=canvas_id,
             top_k=safe_top_k,
-            source_filter=source_filter,
+            source_filters=selected_sources,
             chat_history=history,
         )
+
     except Exception as error:
         print(
-            f"[TEXT RAG ERROR] "
+            "[TEXT RAG ERROR] "
             f"user={safe_user_id} "
             f"canvas={safe_canvas_id} "
-            f"{type(error).__name__}: {error}"
+            f"type={type(error).__name__}: {error}"
         )
 
         raise HTTPException(
@@ -314,20 +405,24 @@ async def query_text_endpoint(
 
     return {
         "mode": "text_rag",
-        "question": question,
-        "answer": result["answer"],
+        "question": safe_question,
+        "answer": result.get(
+            "answer",
+            "No answer was returned.",
+        ),
         "sources": [
             {
-                "file": chunk["source"],
-                "chunk": chunk["chunk_idx"] + 1,
+                "file": chunk.get("source"),
+                "chunk": int(
+                    chunk.get("chunk_idx", 0)
+                ) + 1,
                 "similarity": round(
-                    float(chunk["score"]),
+                    float(chunk.get("score", 0)),
                     4,
                 ),
-                "preview": chunk["text"][:300].replace(
-                    "\n",
-                    " ",
-                ),
+                "preview": str(
+                    chunk.get("text", "")
+                )[:300].replace("\n", " "),
             }
             for chunk in result.get("chunks", [])
         ],
