@@ -298,19 +298,14 @@ async def query_text_endpoint(
             detail=f"The RAG service failed: {error}",
         )
 
-    return {
-        "mode": "text_rag",
-        "question": safe_question,
-        "answer": result.get(
-            "answer",
-            "No answer was returned.",
-        ),
-        "sources": [
+    sources = []
+
+    for index, chunk in enumerate(result.get("chunks", [])):
+        sources.append(
             {
+                "citation_id": f"S{index + 1}",
                 "file": chunk.get("source"),
-                "chunk": int(
-                    chunk.get("chunk_idx", 0)
-                ) + 1,
+                "chunk": int(chunk.get("chunk_idx", 0)) + 1,
                 "similarity": round(
                     float(chunk.get("score", 0)),
                     4,
@@ -320,8 +315,16 @@ async def query_text_endpoint(
                 )[:800].replace("\n", " "),
                 "text": str(chunk.get("text", "")),
             }
-            for chunk in result.get("chunks", [])
-        ],
+        )
+
+    return {
+        "mode": "text_rag",
+        "question": safe_question,
+        "answer": result.get(
+            "answer",
+            "No answer was returned.",
+        ),
+        "sources": sources,
     }
 
 @app.post(

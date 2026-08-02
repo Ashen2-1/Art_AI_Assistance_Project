@@ -38,6 +38,7 @@ When source context is supplied:
    "I cannot find this in the provided sources."
 5. Do not invent quotations, page numbers, citations, results,
    formulas, or evidence.
+6. Do not use LaTeX syntax. Write formulas in plain readable text unless the user specifically asks for mathematical notation.
 
 Use clear Markdown with short paragraphs. Use bullet points when
 they make the response easier to understand.
@@ -237,12 +238,12 @@ def build_context(chunks: List[dict]) -> str:
 
     return "\n\n".join(
         (
-            f"[{chunk['citation_id']}] "
-            f"Source: {chunk['source']}, "
-            f"chunk {chunk['chunk_idx'] + 1}\n"
+            f"[S{index + 1}] "
+            f"Source file: {chunk['source']} | "
+            f"Original chunk: {chunk['chunk_idx'] + 1}\n"
             f"{chunk['text']}"
         )
-        for chunk in chunks
+        for index, chunk in enumerate(chunks)
     )
 
 
@@ -369,17 +370,16 @@ Requirements:
 
 1. Consider every selected source when more than one source is
    selected.
-2. Cite factual claims using the matching citation number, such
-   as [1] or [2].
-3. Do not cite a number that does not exist in the retrieved
-   context.
+2. Cite factual claims using the matching source citation ID,
+   such as [S1] or [S2].
+3. Do not cite original chunk numbers like [3] or [6].
+   Only cite citation IDs that appear in the retrieved context.
 4. If selected sources disagree, explain the disagreement.
 5. If the sources do not contain enough evidence, state the
    limitation clearly.
 6. Use the conversation history only to understand follow-up
    questions. Do not treat conversation history as source evidence.
-7. If mathematical notation appears in the source, preserve it using standard LaTeX inside $...$.
-   If the answer is not about math or formulas, avoid unnecessary LaTeX notation.
+7. Do not use LaTeX syntax. Write formulas in plain readable text unless the user specifically asks for mathematical notation.
 """.strip()
 
     answer = generate_text(
