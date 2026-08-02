@@ -377,6 +377,8 @@ Requirements:
    limitation clearly.
 6. Use the conversation history only to understand follow-up
    questions. Do not treat conversation history as source evidence.
+7. If mathematical notation appears in the source, preserve it using standard LaTeX inside $...$.
+   If the answer is not about math or formulas, avoid unnecessary LaTeX notation.
 """.strip()
 
     answer = generate_text(

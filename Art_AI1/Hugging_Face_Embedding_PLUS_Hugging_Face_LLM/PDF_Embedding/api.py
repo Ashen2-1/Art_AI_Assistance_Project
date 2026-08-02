@@ -422,7 +422,8 @@ async def query_text_endpoint(
                 ),
                 "preview": str(
                     chunk.get("text", "")
-                )[:300].replace("\n", " "),
+                )[:800].replace("\n", " "),
+                "text": str(chunk.get("text", "")),
             }
             for chunk in result.get("chunks", [])
         ],
