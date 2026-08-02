@@ -129,110 +129,6 @@ def parse_chat_history(chat_history: str):
 def parse_source_filters(
     source_filters: str,
     source_filter: Optional[str] = None,
-):
-    selected_sources = []
-
-    if source_filters:
-        try:
-            parsed_sources = json.loads(source_filters)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400,
-                detail="source_filters must be valid JSON.",
-            )
-
-        if isinstance(parsed_sources, list):
-            selected_sources.extend(parsed_sources)
-        elif parsed_sources:
-            selected_sources.append(parsed_sources)
-
-    if source_filter:
-        selected_sources.append(source_filter)
-
-    normalized_sources = []
-
-    for source in selected_sources:
-        source_name = str(source).strip()
-
-        if (
-            source_name
-            and source_name not in normalized_sources
-        ):
-            normalized_sources.append(source_name)
-
-    return normalized_sources[:20]
-
-def parse_source_filters(
-    source_filters: str,
-    source_filter: Optional[str] = None,
-):
-    try:
-        parsed = json.loads(source_filters or "[]")
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="source_filters must be valid JSON.",
-        )
-
-    if not isinstance(parsed, list):
-        raise HTTPException(
-            status_code=400,
-            detail="source_filters must be a JSON array.",
-        )
-
-    candidates = list(parsed)
-
-    # 兼容旧的单文档参数
-    if source_filter:
-        candidates.append(source_filter)
-
-    normalized = []
-
-    for source in candidates:
-        source_name = str(source).strip()
-
-        if (
-            source_name
-            and not source_name.startswith("__nexo_")
-            and source_name not in normalized
-        ):
-            normalized.append(source_name)
-
-    return normalized[:20]
-
-def parse_source_filters(source_filters: str):
-    if not source_filters:
-        return []
-
-    try:
-        parsed = json.loads(source_filters)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="source_filters must be valid JSON.",
-        )
-
-    if not isinstance(parsed, list):
-        raise HTTPException(
-            status_code=400,
-            detail="source_filters must be a JSON array.",
-        )
-
-    cleaned = []
-    seen = set()
-
-    for source in parsed:
-        source_name = str(source).strip()
-
-        if source_name and source_name not in seen:
-            seen.add(source_name)
-            cleaned.append(source_name)
-
-    return cleaned
-
-def parse_source_filters(
-    source_filters: str,
-    source_filter: Optional[str] = None,
 ) -> List[str]:
     try:
         parsed_filters = json.loads(
@@ -252,7 +148,6 @@ def parse_source_filters(
 
     candidates = list(parsed_filters)
 
-    # Temporary support for the old single-source parameter.
     if source_filter:
         candidates.append(source_filter)
 
