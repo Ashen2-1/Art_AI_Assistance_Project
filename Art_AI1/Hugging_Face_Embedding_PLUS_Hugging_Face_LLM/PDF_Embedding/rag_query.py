@@ -380,6 +380,7 @@ Requirements:
 6. Use the conversation history only to understand follow-up
    questions. Do not treat conversation history as source evidence.
 7. Do not use LaTeX syntax. Write formulas in plain readable text unless the user specifically asks for mathematical notation.
+8. When citing multiple sources, write them separately as [S1] [S2] [S3], not inside one combined bracket.
 """.strip()
 
     answer = generate_text(
