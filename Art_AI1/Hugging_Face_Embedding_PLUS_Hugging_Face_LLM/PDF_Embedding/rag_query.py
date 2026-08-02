@@ -313,6 +313,7 @@ def query_text_rag(
     )
 
     chunks = retrieve(
+        question=question,
         top_k=safe_top_k,
         user_id=safe_user_id,
         canvas_id=safe_canvas_id,
