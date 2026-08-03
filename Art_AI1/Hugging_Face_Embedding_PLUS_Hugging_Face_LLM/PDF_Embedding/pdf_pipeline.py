@@ -24,6 +24,7 @@ import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageFilter
 from pypdf import PdfReader
+import re
 
 # ── Tesseract binary (Windows) ────────────────────────────────
 if os.name == "nt":
@@ -43,6 +44,29 @@ DEFAULT_CHUNK_SIZE    = 1000
 DEFAULT_CHUNK_OVERLAP = 200
 OCR_DPI               = 400   # higher DPI = more detail for Tesseract
 
+
+
+
+
+def is_bad_pdf_text(text: str) -> bool:
+    if not text:
+        return True
+
+    cid_count = len(re.findall(r"\(cid:\d+\)", text))
+    total_len = max(len(text), 1)
+
+    cid_ratio = cid_count / total_len
+
+    # too many CID font fragments
+    if cid_count >= 20 and cid_ratio > 0.01:
+        return True
+
+    # too little real alphabetic content
+    letters = len(re.findall(r"[A-Za-z]", text))
+    if len(text) > 500 and letters / total_len < 0.15:
+        return True
+
+    return False
 
 # =============================================================
 # A. PAGE / COLUMN SPLITTER
@@ -399,52 +423,80 @@ def extract_pdf_text(pdf_path: str, ocr_mode: str = "printed") -> str:
     """
     Full extraction chain with selectable OCR engine.
 
-    Parameters
-    ----------
-    pdf_path : str
-        Path to the PDF file.
-    ocr_mode : str
-        "printed"  (default) - Tesseract + preprocessing
-        "cursive"            - TrOCR handwriting model
+    Extraction order:
+    1. pdfplumber for normal digital PDFs
+    2. OCR fallback if the PDF is scanned or extracted text is corrupted
+    3. pypdf fallback only if OCR fails
 
-    Returns
-    -------
-    str  - all text from every page, with [Page N] headers.
+    Returns:
+        str - all text from every page, with [Page N] headers.
     """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    mode_label = "Cursive/Handwriting (TrOCR)" if ocr_mode == "cursive" else "Printed/Scanned (Tesseract)"
+    mode_label = (
+        "Cursive/Handwriting (TrOCR)"
+        if ocr_mode == "cursive"
+        else "Printed/Scanned (Tesseract)"
+    )
+
     print(f"\n[PDF Pipeline] -- Processing : {os.path.basename(pdf_path)}")
     print(f"[PDF Pipeline]    OCR mode   : {mode_label}")
 
-    # -- Step 1: pdfplumber (always tried first) ----------------------
+    # -- Step 1: pdfplumber -----------------------------------------
     try:
         text, num_pages = _extract_pdfplumber(pdf_path)
-        if not _is_scanned(text, num_pages):
-            avg = len(text.strip()) // max(num_pages, 1)
-            print(f"[PDF Pipeline] OK pdfplumber  |  {num_pages} pages  |  ~{avg} chars/page")
-            return text
-        else:
-            avg = len(text.strip()) // max(num_pages, 1)
-            print(f"[PDF Pipeline] Scanned PDF detected (~{avg} chars/page) -> switching to OCR")
-    except Exception as e:
-        print(f"[PDF Pipeline] pdfplumber error: {e}  -> trying OCR")
+        avg = len(text.strip()) // max(num_pages, 1)
 
-    # -- Step 2: OCR (engine chosen by ocr_mode) ---------------------
+        if _is_scanned(text, num_pages):
+            print(
+                f"[PDF Pipeline] Scanned PDF detected "
+                f"(~{avg} chars/page) -> switching to OCR"
+            )
+        elif is_bad_pdf_text(text):
+            print(
+                f"[PDF Pipeline] Bad digital text detected "
+                f"(CID/custom font issue, ~{avg} chars/page) -> switching to OCR"
+            )
+        else:
+            print(
+                f"[PDF Pipeline] OK pdfplumber  |  "
+                f"{num_pages} pages  |  ~{avg} chars/page"
+            )
+            return text
+
+    except Exception as e:
+        print(f"[PDF Pipeline] pdfplumber error: {e} -> trying OCR")
+
+    # -- Step 2: OCR -------------------------------------------------
     try:
         if ocr_mode == "cursive":
             text = _extract_ocr_cursive(pdf_path)
         else:
             text = _extract_ocr_printed(pdf_path)
+
+        if is_bad_pdf_text(text):
+            raise ValueError(
+                "OCR output is still unreadable. "
+                "The PDF may use unusual encoding, low-quality images, or unsupported symbols."
+            )
+
         print(f"[PDF Pipeline] OK OCR complete  |  {len(text)} chars extracted")
         return text
-    except Exception as e:
-        print(f"[PDF Pipeline] OCR error: {e}  -> falling back to PyPDFLoader")
 
-    # -- Step 3: PyPDFLoader fallback --------------------------------
+    except Exception as e:
+        print(f"[PDF Pipeline] OCR error: {e} -> falling back to PyPDF")
+
+    # -- Step 3: pypdf fallback -------------------------------------
     text = _extract_pypdf(pdf_path)
-    print(f"[PDF Pipeline] OK PyPDFLoader fallback  |  {len(text)} chars extracted")
+
+    if is_bad_pdf_text(text):
+        raise ValueError(
+            "This PDF could not be indexed because the extracted text is unreadable. "
+            "It may use embedded/custom font encoding or require a stronger OCR pipeline."
+        )
+
+    print(f"[PDF Pipeline] OK PyPDF fallback  |  {len(text)} chars extracted")
     return text
 
 
@@ -553,9 +605,27 @@ def process_pdf(
     # Handwritten letter or cursive manuscript:
     chunks = process_pdf("letter.pdf", ocr_mode="cursive")
     """
-    text   = extract_pdf_text(pdf_path, ocr_mode=ocr_mode)
+    text = extract_pdf_text(pdf_path, ocr_mode=ocr_mode)
+
+    if is_bad_pdf_text(text):
+        raise ValueError(
+            "The extracted PDF text is unreadable and will not be indexed."
+        )
+
     chunks = chunk_text(text, chunk_size, chunk_overlap)
-    return chunks
+
+    good_chunks = [
+        chunk
+        for chunk in chunks
+        if not is_bad_pdf_text(chunk)
+    ]
+
+    if not good_chunks:
+        raise ValueError(
+            "No readable chunks were produced from this PDF."
+        )
+
+    return good_chunks
 
 
 # =============================================================
