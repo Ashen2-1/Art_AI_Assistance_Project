@@ -139,6 +139,12 @@ def ingest_pdf(
     print(
         f"[Embed] Model: {EMBEDDING_MODEL}"
     )
+    print(
+        f"[Embed] User: {safe_user_id}"
+    )
+    print(
+        f"[Embed] Canvas: {safe_canvas_id}"
+    )
 
     # Step 1: extract and chunk
     chunks = process_pdf(

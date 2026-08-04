@@ -372,12 +372,29 @@ async def ingest_document(
             file_content = await file.read()
             tmp_path.write_bytes(file_content)
 
-            chunks_added = await run_in_threadpool(
-                ingest_pdf,
-                str(tmp_path),
-                safe_user_id,
-                safe_canvas_id,
-                ocr_mode,
+            def run_ingest():
+                return ingest_pdf(
+                    pdf_path=str(tmp_path),
+                    user_id=safe_user_id,
+                    canvas_id=safe_canvas_id,
+                    ocr_mode=ocr_mode,
+                )
+
+            print(
+                f"[INGEST START] "
+                f"user={safe_user_id} "
+                f"canvas={safe_canvas_id} "
+                f"file={original_filename}"
+            )
+
+            chunks_added = await run_in_threadpool(run_ingest)
+
+            print(
+                f"[INGEST DONE] "
+                f"user={safe_user_id} "
+                f"canvas={safe_canvas_id} "
+                f"file={original_filename} "
+                f"chunks={chunks_added}"
             )
 
         stats = get_stats(
