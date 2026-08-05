@@ -409,45 +409,99 @@ def _extract_ocr_cursive(pdf_path: str) -> str:
 
 def _extract_page_text_smart(page) -> str:
     """
-    Column-aware text extraction for a single pdfplumber page.
+    Column-aware extraction for digital PDFs.
 
-    Problem: pdfplumber's default extract_text() reads words in
-    Y-order across the full page width. For two-column layouts this
-    mixes both columns line by line, producing garbled output.
+    Important:
+    Do NOT split a normal single-column page just because words appear
+    on both the left and right half of the page.
 
-    Fix:
-      1. Use extract_words() to get bounding boxes of every word.
-      2. Count words in the left half vs right half.
-      3. If both halves have significant content (>25% each) the page
-         is two-column: crop left and right separately and extract
-         each column in its own Y-sorted order.
-      4. Otherwise fall back to default extract_text().
+    We only split when there is a real blank vertical gutter near the
+    page center.
     """
-    words = page.extract_words(x_tolerance=3, y_tolerance=3)
+
+    words = page.extract_words(
+        x_tolerance=3,
+        y_tolerance=3,
+        keep_blank_chars=False,
+    )
+
     if not words:
         return page.extract_text() or ""
 
-    x_mid       = page.width / 2
-    total       = len(words)
-    left_count  = sum(1 for w in words if float(w["x0"]) < x_mid)
-    right_count = sum(1 for w in words if float(w["x0"]) >= x_mid)
+    x_mid = page.width / 2
+    total = len(words)
 
-    # Two-column heuristic: both sides must have at least 25% of words
+    left_words = [
+        word for word in words
+        if float(word["x1"]) < x_mid
+    ]
+
+    right_words = [
+        word for word in words
+        if float(word["x0"]) > x_mid
+    ]
+
+    # Words near the center line mean this is probably normal single-column text.
+    gutter_half_width = page.width * 0.045
+
+    gutter_words = [
+        word for word in words
+        if (
+            x_mid - gutter_half_width
+            <= (float(word["x0"]) + float(word["x1"])) / 2
+            <= x_mid + gutter_half_width
+        )
+    ]
+
+    left_ratio = len(left_words) / max(total, 1)
+    right_ratio = len(right_words) / max(total, 1)
+    gutter_ratio = len(gutter_words) / max(total, 1)
+
+    # True two-column pages usually have:
+    # 1. enough text on both sides
+    # 2. a mostly empty center gutter
+    # 3. enough total words to avoid false positives from title pages
     is_two_col = (
-        total > 10
-        and (left_count  / total) > 0.25
-        and (right_count / total) > 0.25
+        total > 80
+        and left_ratio > 0.25
+        and right_ratio > 0.25
+        and gutter_ratio < 0.035
     )
 
     if is_two_col:
-        # Crop each column and extract text independently
-        left_col  = page.crop((0,     0, x_mid,       page.height))
-        right_col = page.crop((x_mid, 0, page.width,  page.height))
-        left_text  = left_col.extract_text()  or ""
-        right_text = right_col.extract_text() or ""
+        gutter_left = x_mid - gutter_half_width
+        gutter_right = x_mid + gutter_half_width
+
+        left_col = page.crop((0, 0, gutter_left, page.height))
+        right_col = page.crop((gutter_right, 0, page.width, page.height))
+
+        left_text = left_col.extract_text(
+            x_tolerance=3,
+            y_tolerance=3,
+        ) or ""
+
+        right_text = right_col.extract_text(
+            x_tolerance=3,
+            y_tolerance=3,
+        ) or ""
+
+        print(
+            "[PDF Pipeline] Two-column digital page detected "
+            f"(left={left_ratio:.2f}, right={right_ratio:.2f}, gutter={gutter_ratio:.2f})"
+        )
+
         return (left_text + "\n\n" + right_text).strip()
 
-    return page.extract_text() or ""
+    print(
+        "[PDF Pipeline] Single-column digital page detected "
+        f"(left={left_ratio:.2f}, right={right_ratio:.2f}, gutter={gutter_ratio:.2f})"
+    )
+
+    return page.extract_text(
+        x_tolerance=3,
+        y_tolerance=3,
+        layout=False,
+    ) or ""
 
 
 def _extract_pdfplumber(pdf_path: str) -> tuple:
