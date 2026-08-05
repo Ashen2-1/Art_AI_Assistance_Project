@@ -409,14 +409,14 @@ def _extract_ocr_cursive(pdf_path: str) -> str:
 
 def _extract_page_text_smart(page) -> str:
     """
-    Column-aware extraction for digital PDFs.
+    Smarter digital PDF extraction.
 
-    Important:
-    Do NOT split a normal single-column page just because words appear
-    on both the left and right half of the page.
-
-    We only split when there is a real blank vertical gutter near the
-    page center.
+    Rule:
+    - Normal single-column pages often have many text lines crossing the center.
+    - Real two-column pages usually have a blank vertical gutter in the center,
+      and most body lines do NOT cross the center.
+    - Full-width title lines are allowed, but they should not cause us to split
+      a normal single-column document incorrectly.
     """
 
     words = page.extract_words(
@@ -429,8 +429,41 @@ def _extract_page_text_smart(page) -> str:
         return page.extract_text() or ""
 
     x_mid = page.width / 2
-    total = len(words)
+    total_words = len(words)
 
+    # Group words into visual lines by y position.
+    line_buckets = {}
+
+    for word in words:
+        top_key = round(float(word["top"]) / 4) * 4
+        line_buckets.setdefault(top_key, []).append(word)
+
+    lines = []
+
+    for line_words in line_buckets.values():
+        if not line_words:
+            continue
+
+        x0 = min(float(word["x0"]) for word in line_words)
+        x1 = max(float(word["x1"]) for word in line_words)
+
+        lines.append({
+            "x0": x0,
+            "x1": x1,
+            "word_count": len(line_words),
+        })
+
+    total_lines = max(len(lines), 1)
+
+    # A line crosses the center if its text visually runs across the midpoint.
+    crossing_lines = [
+        line for line in lines
+        if line["x0"] < x_mid and line["x1"] > x_mid
+    ]
+
+    crossing_ratio = len(crossing_lines) / total_lines
+
+    # Count words clearly on left and right.
     left_words = [
         word for word in words
         if float(word["x1"]) < x_mid
@@ -441,7 +474,10 @@ def _extract_page_text_smart(page) -> str:
         if float(word["x0"]) > x_mid
     ]
 
-    # Words near the center line mean this is probably normal single-column text.
+    left_ratio = len(left_words) / max(total_words, 1)
+    right_ratio = len(right_words) / max(total_words, 1)
+
+    # Center gutter check.
     gutter_half_width = page.width * 0.045
 
     gutter_words = [
@@ -453,18 +489,23 @@ def _extract_page_text_smart(page) -> str:
         )
     ]
 
-    left_ratio = len(left_words) / max(total, 1)
-    right_ratio = len(right_words) / max(total, 1)
-    gutter_ratio = len(gutter_words) / max(total, 1)
+    gutter_ratio = len(gutter_words) / max(total_words, 1)
 
-    # True two-column pages usually have:
-    # 1. enough text on both sides
-    # 2. a mostly empty center gutter
-    # 3. enough total words to avoid false positives from title pages
+    # Key fix:
+    # If many lines cross the center, this is a normal single-column page.
+    # Do not split.
+    is_single_column = crossing_ratio > 0.18
+
+    # Only split if:
+    # 1. enough words exist,
+    # 2. both left and right sides have real content,
+    # 3. center gutter is mostly empty,
+    # 4. most lines do NOT cross the center.
     is_two_col = (
-        total > 80
-        and left_ratio > 0.25
-        and right_ratio > 0.25
+        not is_single_column
+        and total_words > 120
+        and left_ratio > 0.22
+        and right_ratio > 0.22
         and gutter_ratio < 0.035
     )
 
@@ -478,23 +519,27 @@ def _extract_page_text_smart(page) -> str:
         left_text = left_col.extract_text(
             x_tolerance=3,
             y_tolerance=3,
+            layout=False,
         ) or ""
 
         right_text = right_col.extract_text(
             x_tolerance=3,
             y_tolerance=3,
+            layout=False,
         ) or ""
 
         print(
             "[PDF Pipeline] Two-column digital page detected "
-            f"(left={left_ratio:.2f}, right={right_ratio:.2f}, gutter={gutter_ratio:.2f})"
+            f"(left={left_ratio:.2f}, right={right_ratio:.2f}, "
+            f"gutter={gutter_ratio:.2f}, crossing={crossing_ratio:.2f})"
         )
 
         return (left_text + "\n\n" + right_text).strip()
 
     print(
         "[PDF Pipeline] Single-column digital page detected "
-        f"(left={left_ratio:.2f}, right={right_ratio:.2f}, gutter={gutter_ratio:.2f})"
+        f"(left={left_ratio:.2f}, right={right_ratio:.2f}, "
+        f"gutter={gutter_ratio:.2f}, crossing={crossing_ratio:.2f})"
     )
 
     return page.extract_text(
