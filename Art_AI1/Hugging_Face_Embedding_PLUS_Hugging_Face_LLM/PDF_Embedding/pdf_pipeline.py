@@ -53,12 +53,15 @@ def clean_pdf_text(raw_text: str) -> str:
 
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Remove common standalone page numbers
+    # Normalize CID artifacts.
+    text = re.sub(r"\(cid:\d+\)", " ", text)
+
+    # Remove standalone page numbers, but keep [Page N] markers.
     text = re.sub(r"\n\s*\d+\s*\n", "\n", text)
 
-    # Remove repeated all-caps running headers, but keep normal content
+    # Remove repeated all-caps running headers, but keep normal content.
     text = re.sub(
-        r"\n\s*[A-Z][A-Z\s,'’?:;-]{8,}\s*\n",
+        r"\n\s*[A-Z][A-Z\s,'’?:;-]{12,}\s*\n",
         "\n",
         text,
     )
@@ -67,14 +70,40 @@ def clean_pdf_text(raw_text: str) -> str:
     # photo-\ngraphy -> photography
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
 
-    # Join line breaks inside paragraphs:
-    # "process by\nwhich" -> "process by which"
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    # Join broken lines inside the same paragraph.
+    # Keep paragraph breaks and [Page N] markers.
+    lines = text.split("\n")
+    rebuilt = []
+    paragraph = []
 
-    # Normalize spaces
+    def flush_paragraph():
+        nonlocal paragraph
+        if paragraph:
+            rebuilt.append(" ".join(paragraph).strip())
+            paragraph = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            flush_paragraph()
+            rebuilt.append("")
+            continue
+
+        if re.match(r"^\[Page\s+\d+\]$", stripped):
+            flush_paragraph()
+            rebuilt.append(stripped)
+            rebuilt.append("")
+            continue
+
+        paragraph.append(stripped)
+
+    flush_paragraph()
+
+    text = "\n".join(rebuilt)
+
+    # Normalize spaces but preserve paragraph breaks.
     text = re.sub(r"[ \t]+", " ", text)
-
-    # Normalize paragraph gaps
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
@@ -541,22 +570,140 @@ def extract_pdf_text(pdf_path: str, ocr_mode: str = "printed") -> str:
 
 def chunk_text(
     text: str,
-    chunk_size: int    = DEFAULT_CHUNK_SIZE,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> List[str]:
     """
-    Split extracted text into overlapping chunks for embedding.
+    Split extracted text into readable page-aware chunks.
 
-    Returns
-    -------
-    List[str]  - chunks ready to pass to the embedding model.
+    Main goals:
+    1. Keep page markers.
+    2. Prefer paragraph boundaries.
+    3. Avoid cutting through sentences unless necessary.
+    4. Keep chunks readable in the citation card.
     """
-    # Simple recursive character splitter (no langchain dependency)
-    separators = ["\n\n", "\n", ". ", " ", ""]
-    chunks = _recursive_split(text, chunk_size, chunk_overlap, separators)
-    print(f"[PDF Pipeline] OK {len(chunks)} chunks  (size={chunk_size}, overlap={chunk_overlap})")
-    return chunks
 
+    del chunk_overlap
+
+    if not text or not text.strip():
+        return []
+
+    page_blocks = re.split(r"(\[Page\s+\d+\])", text)
+
+    page_sections = []
+    current_page = "Unknown page"
+
+    for part in page_blocks:
+        part = part.strip()
+
+        if not part:
+            continue
+
+        if re.match(r"^\[Page\s+\d+\]$", part):
+            current_page = part
+            continue
+
+        page_sections.append((current_page, part))
+
+    chunks = []
+
+    for page_label, page_text in page_sections:
+        paragraphs = [
+            paragraph.strip()
+            for paragraph in re.split(r"\n\s*\n", page_text)
+            if paragraph.strip()
+        ]
+
+        current = ""
+
+        for paragraph in paragraphs:
+            paragraph_with_page = f"{page_label}\n{paragraph}"
+
+            if len(paragraph_with_page) > chunk_size:
+                if current.strip():
+                    chunks.append(current.strip())
+                    current = ""
+
+                sentence_chunks = _split_long_paragraph(
+                    page_label=page_label,
+                    paragraph=paragraph,
+                    chunk_size=chunk_size,
+                )
+
+                chunks.extend(sentence_chunks)
+                continue
+
+            candidate = (
+                f"{current}\n\n{paragraph}"
+                if current
+                else paragraph_with_page
+            )
+
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                if current.strip():
+                    chunks.append(current.strip())
+
+                current = paragraph_with_page
+
+        if current.strip():
+            chunks.append(current.strip())
+
+    cleaned_chunks = [
+        chunk.strip()
+        for chunk in chunks
+        if chunk.strip()
+    ]
+
+    print(
+        f"[PDF Pipeline] OK {len(cleaned_chunks)} readable chunks "
+        f"(target size={chunk_size})"
+    )
+
+    return cleaned_chunks
+
+def _split_long_paragraph(
+    page_label: str,
+    paragraph: str,
+    chunk_size: int,
+) -> List[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+
+        if not sentence:
+            continue
+
+        candidate = (
+            f"{current} {sentence}".strip()
+            if current
+            else f"{page_label}\n{sentence}"
+        )
+
+        if len(candidate) <= chunk_size:
+            current = candidate
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+
+            if len(sentence) > chunk_size:
+                for start in range(0, len(sentence), chunk_size):
+                    part = sentence[start : start + chunk_size].strip()
+                    if part:
+                        chunks.append(f"{page_label}\n{part}")
+                current = ""
+            else:
+                current = f"{page_label}\n{sentence}"
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
 
 def _recursive_split(
     text: str,
