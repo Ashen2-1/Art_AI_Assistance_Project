@@ -189,7 +189,24 @@ app = FastAPI(
     version="1.2.0",
     lifespan=lifespan,
 )
+@app.middleware("http")
+async def log_requests(request, call_next):
+    print(f"[REQUEST START] {request.method} {request.url.path}")
 
+    try:
+        response = await call_next(request)
+        print(
+            f"[REQUEST DONE] {request.method} {request.url.path} "
+            f"status={response.status_code}"
+        )
+        return response
+
+    except Exception as error:
+        print(
+            f"[REQUEST CRASH] {request.method} {request.url.path} "
+            f"{type(error).__name__}: {error}"
+        )
+        raise
 
 @app.get("/health")
 async def health():
@@ -277,9 +294,9 @@ async def query_text_endpoint(
 
     try:
         result = query_text_rag(
-            question=question,
-            user_id=user_id,
-            canvas_id=canvas_id,
+            question=safe_question,
+            user_id=safe_user_id,
+            canvas_id=safe_canvas_id,
             top_k=safe_top_k,
             source_filters=selected_sources,
             chat_history=history,
@@ -422,6 +439,12 @@ async def ingest_document(
             f"canvas={safe_canvas_id} "
             f"{type(error).__name__}: {error}"
         )
+
+        print("========== INGEST FAILED ==========")
+        print(f"file: {file.filename if file else 'unknown'}")
+        print(f"user_id: {user_id}")
+        print(f"canvas_id: {canvas_id}")
+        print(str(error))
 
         raise HTTPException(
             status_code=500,
