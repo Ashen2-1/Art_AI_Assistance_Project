@@ -492,35 +492,6 @@ async def delete_source(
         "chunks_removed": deleted,
     }
 
-async def delete_source(
-    source_name: str,
-    user_id: str = Query(...),
-    canvas_id: str = Query("default"),
-):
-    safe_user_id, safe_canvas_id = normalize_identity(
-        user_id,
-        canvas_id,
-    )
-
-    deleted = db_delete_source(
-        source_name=source_name,
-        user_id=safe_user_id,
-        canvas_id=safe_canvas_id,
-    )
-
-    if deleted == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Source '{source_name}' was not found.",
-        )
-
-    return {
-        "status": "deleted",
-        "source": source_name,
-        "chunks_removed": deleted,
-    }
-
-
 if __name__ == "__main__":
     port = int(
         os.getenv("PORT", "8000")

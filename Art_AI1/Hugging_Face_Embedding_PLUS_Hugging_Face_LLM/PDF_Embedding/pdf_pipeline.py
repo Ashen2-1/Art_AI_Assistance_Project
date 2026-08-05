@@ -47,6 +47,38 @@ OCR_DPI               = 400   # higher DPI = more detail for Tesseract
 
 
 
+def clean_pdf_text(raw_text: str) -> str:
+    if not raw_text:
+        return ""
+
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove common standalone page numbers
+    text = re.sub(r"\n\s*\d+\s*\n", "\n", text)
+
+    # Remove repeated all-caps running headers, but keep normal content
+    text = re.sub(
+        r"\n\s*[A-Z][A-Z\s,'’?:;-]{8,}\s*\n",
+        "\n",
+        text,
+    )
+
+    # Fix hyphenated line breaks:
+    # photo-\ngraphy -> photography
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+
+    # Join line breaks inside paragraphs:
+    # "process by\nwhich" -> "process by which"
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+
+    # Normalize spaces
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Normalize paragraph gaps
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
 
 def is_bad_pdf_text(text: str) -> bool:
     if not text:
@@ -609,6 +641,10 @@ def process_pdf(
     chunks = process_pdf("letter.pdf", ocr_mode="cursive")
     """
     text = extract_pdf_text(pdf_path, ocr_mode=ocr_mode)
+
+    # Clean extracted PDF text before chunking.
+    # This fixes broken line breaks, page-number noise, and cross-page paragraph splits.
+    text = clean_pdf_text(text)
 
     if is_bad_pdf_text(text):
         raise ValueError(
