@@ -267,6 +267,7 @@ async def query_text_endpoint(
     source_filters: str = Form("[]"),
     source_filter: Optional[str] = Form(None),
     chat_history: str = Form("[]"),
+    inline_context: str = Form(""),
 ):
     safe_question = question.strip()
     safe_user_id = user_id.strip()
@@ -300,6 +301,7 @@ async def query_text_endpoint(
             top_k=safe_top_k,
             source_filters=selected_sources,
             chat_history=history,
+            inline_context=inline_context,
         )
 
     except Exception as error:

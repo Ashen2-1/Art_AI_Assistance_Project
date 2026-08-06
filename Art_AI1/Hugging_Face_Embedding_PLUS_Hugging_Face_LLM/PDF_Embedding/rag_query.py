@@ -255,6 +255,7 @@ def query_text_rag(
     source_filters=None,
     source_filter=None,
     chat_history=None,
+    inline_context: str = "",
 ):
     safe_user_id = str(user_id or "").strip()
 
@@ -332,6 +333,14 @@ def query_text_rag(
         }
 
     context = build_context(chunks)
+
+    if inline_context and inline_context.strip():
+        context = (
+                context
+                + "\n\n"
+                + "[EXTERNAL SOURCE CONTEXT]\n"
+                + inline_context.strip()
+        )
 
     history = format_chat_history(
         chat_history or []
