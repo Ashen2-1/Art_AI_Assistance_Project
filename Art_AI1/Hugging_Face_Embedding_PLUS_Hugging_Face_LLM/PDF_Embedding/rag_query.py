@@ -274,37 +274,6 @@ def query_text_rag(
         min(int(top_k or 5), 10),
     )
 
-    selected_sources = []
-
-    if isinstance(source_filters, list):
-        selected_sources.extend(source_filters)
-
-    elif isinstance(source_filters, str) and source_filters.strip():
-        try:
-            parsed_sources = json.loads(source_filters)
-
-            if isinstance(parsed_sources, list):
-                selected_sources.extend(parsed_sources)
-            else:
-                selected_sources.append(source_filters)
-        except json.JSONDecodeError:
-            selected_sources.append(source_filters)
-
-    if source_filter:
-        selected_sources.append(source_filter)
-
-    selected_sources = list(
-        dict.fromkeys(
-            str(source).strip()
-            for source in selected_sources
-            if str(source).strip()
-        )
-    )
-    """
-    Answer using only documents belonging to the current user
-    and Canvas.
-    """
-
     print(
         f"[RAG] Text RAG question: {question!r}"
     )
@@ -314,6 +283,10 @@ def query_text_rag(
         source_filter=source_filter,
     )
 
+    safe_inline_context = str(
+        inline_context or ""
+    ).strip()
+
     chunks = retrieve(
         question=question,
         top_k=safe_top_k,
@@ -322,7 +295,22 @@ def query_text_rag(
         source_filters=selected_sources,
     )
 
-    if not chunks:
+    inline_chunks = []
+
+    if safe_inline_context:
+        inline_chunks.append(
+            {
+                "citation_id": len(chunks) + 1,
+                "text": safe_inline_context[:25000],
+                "source": "External / Web Source",
+                "chunk_idx": 0,
+                "score": 1.0,
+            }
+        )
+
+    all_chunks = chunks + inline_chunks
+
+    if not all_chunks:
         return {
             "answer": (
                 "No matching source material was found in this "
@@ -332,15 +320,7 @@ def query_text_rag(
             "mode": "text_rag",
         }
 
-    context = build_context(chunks)
-
-    if inline_context and inline_context.strip():
-        context = (
-                context
-                + "\n\n"
-                + "[EXTERNAL SOURCE CONTEXT]\n"
-                + inline_context.strip()
-        )
+    context = build_context(all_chunks)
 
     history = format_chat_history(
         chat_history or []
@@ -352,7 +332,7 @@ def query_text_rag(
             for source in selected_sources
         )
         if selected_sources
-        else "All indexed sources in the current Canvas"
+        else "Selected inline/web sources or all indexed sources in the current Canvas"
     )
 
     prompt = f"""
@@ -401,7 +381,7 @@ Requirements:
 
     return {
         "answer": answer,
-        "chunks": chunks,
+        "chunks": all_chunks,
         "mode": "text_rag",
     }
 
