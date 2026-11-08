@@ -44,6 +44,29 @@ def _gemini_url(model: str = "") -> str:
     )
 
 
+def _post_gemini(model: str, api_key: str, payload: dict, timeout: int) -> requests.Response:
+    """
+    POST to Gemini. If the chosen model was retired (HTTP 404, e.g. an old
+    model picked in Settings -> AI keys), retry once with NEXO's default
+    model so uploads and answers keep working.
+    """
+    response = requests.post(
+        _gemini_url(model),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        json=payload,
+        timeout=timeout,
+    )
+    if response.status_code == 404 and model and model != GEMINI_MODEL:
+        print(f"[Gemini] model {model!r} unavailable (404); retrying with {GEMINI_MODEL!r}")
+        response = requests.post(
+            _gemini_url(GEMINI_MODEL),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            json=payload,
+            timeout=timeout,
+        )
+    return response
+
+
 def _raise_user_provider_error(provider: str, response: requests.Response) -> None:
     name = PROVIDER_NAMES.get(provider, provider)
     message = _read_error_message(response)
@@ -222,7 +245,7 @@ def generate_text(
 
     own_gemini = provider == "gemini" and bool(user_key)
     api_key = user_key if own_gemini else GEMINI_API_KEY
-    api_url = _gemini_url(user_model) if own_gemini else GEMINI_API_URL
+    gemini_model = user_model if own_gemini and user_model else GEMINI_MODEL
 
     if not api_key:
         raise GeminiAPIError(
@@ -256,15 +279,7 @@ def generate_text(
         }
 
     try:
-        response = requests.post(
-            api_url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            json=payload,
-            timeout=90,
-        )
+        response = _post_gemini(gemini_model, api_key, payload, 90)
     except requests.Timeout as error:
         raise GeminiAPIError(
             "Gemini request timed out. Please try again."
@@ -428,12 +443,7 @@ def generate_multimodal(
         payload["systemInstruction"] = {"parts": [{"text": system_instruction.strip()}]}
 
     try:
-        response = requests.post(
-            _gemini_url(model),
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-            json=payload,
-            timeout=150,
-        )
+        response = _post_gemini(model, api_key, payload, 150)
     except requests.Timeout as error:
         raise GeminiAPIError("Gemini request timed out. Please try again.") from error
     except requests.RequestException as error:
