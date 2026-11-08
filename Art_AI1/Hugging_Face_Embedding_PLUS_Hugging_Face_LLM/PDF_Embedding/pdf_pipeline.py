@@ -24,6 +24,8 @@ import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageFilter
 from pypdf import PdfReader
+
+from ingest_progress import report as report_progress
 import re
 
 # ── Tesseract binary (Windows) ────────────────────────────────
@@ -334,6 +336,7 @@ def _extract_ocr_printed(pdf_path: str) -> str:
 
     for i, image in enumerate(images):
         print(f"[PDF Pipeline]   Scan {i + 1}/{len(images)} ...")
+        report_progress("ocr", i, len(images))
 
         # Split open-book spreads into individual pages
         sub_pages = _split_two_page_scan(image)
@@ -383,6 +386,7 @@ def _extract_ocr_cursive(pdf_path: str) -> str:
 
     for i, page_img in enumerate(images):
         print(f"[PDF Pipeline]   Cursive OCR page {i + 1}/{len(images)} ...")
+        report_progress("ocr", i, len(images))
         lines     = _segment_lines(page_img)
         page_text = ""
 
@@ -558,6 +562,8 @@ def _extract_pdfplumber(pdf_path: str) -> tuple:
     with pdfplumber.open(pdf_path) as pdf:
         num_pages = len(pdf.pages)
         for i, page in enumerate(pdf.pages):
+            # Digital pages are fast; count them as the first half of "reading".
+            report_progress("reading", i + 1, num_pages * 2)
             text = _extract_page_text_smart(page)
             if text:
                 full_text += f"[Page {i + 1}]\n{text}\n\n"
