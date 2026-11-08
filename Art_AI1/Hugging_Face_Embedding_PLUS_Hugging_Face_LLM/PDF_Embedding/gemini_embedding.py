@@ -10,6 +10,8 @@ from typing import List, Optional
 import requests
 from dotenv import load_dotenv
 
+import user_keys
+
 from ingest_progress import report as report_progress
 
 
@@ -206,7 +208,7 @@ def embed_text(
         For user search questions.
     """
 
-    if not GEMINI_API_KEY:
+    if not user_keys.gemini_key(GEMINI_API_KEY):
         raise GeminiEmbeddingError(
             f"GEMINI_API_KEY was not found in {ENV_PATH}"
         )
@@ -321,7 +323,8 @@ def _post_with_retries(
                 url,
                 headers={
                     "Content-Type": "application/json",
-                    "x-goog-api-key": GEMINI_API_KEY,
+                    # The user's own Gemini key when connected; same model, so vectors match.
+                    "x-goog-api-key": user_keys.gemini_key(GEMINI_API_KEY),
                 },
                 json=payload,
                 timeout=120,
@@ -436,7 +439,7 @@ def embed_documents(
     Output order always matches input order.
     """
 
-    if not GEMINI_API_KEY:
+    if not user_keys.gemini_key(GEMINI_API_KEY):
         raise GeminiEmbeddingError(
             f"GEMINI_API_KEY was not found in {ENV_PATH}"
         )

@@ -17,6 +17,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     Security,
     UploadFile,
 )
@@ -41,6 +42,8 @@ from document_pipeline import (
 from embed_pipeline import ingest_document as index_document_file
 from gemini_embedding import GeminiQuotaError
 import ingest_progress
+import user_keys
+from gemini_client import UserKeyError
 from rag_query import query_general, query_text_rag
 
 
@@ -246,6 +249,7 @@ async def health():
 
 )
 async def query_general_endpoint(
+    request: Request,
     question: str = Form(...),
     chat_history: str = Form("[]"),
     domain: str = Form("auto"),
@@ -254,12 +258,15 @@ async def query_general_endpoint(
     history = parse_chat_history(chat_history)
 
     try:
-        result = query_general(
-            question,
-            chat_history=history,
-            domain=domain,
-            task=task,
-        )
+        with user_keys.using(user_keys.from_headers(request.headers)):
+            result = query_general(
+                question,
+                chat_history=history,
+                domain=domain,
+                task=task,
+            )
+    except UserKeyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
     except Exception as error:
         print(
             f"[GENERAL QUERY ERROR] "
@@ -284,6 +291,7 @@ async def query_general_endpoint(
     dependencies=[Depends(require_api_key)],
 )
 async def query_text_endpoint(
+    request: Request,
     question: str = Form(...),
     user_id: str = Form(...),
     canvas_id: str = Form("default"),
@@ -317,21 +325,30 @@ async def query_text_endpoint(
         source_filter=source_filter,
     )
 
+    request_keys = user_keys.from_headers(request.headers)
+
     try:
-        result = query_text_rag(
-            question=safe_question,
-            user_id=safe_user_id,
-            canvas_id=safe_canvas_id,
-            top_k=safe_top_k,
-            source_filters=selected_sources,
-            chat_history=history,
-            inline_context=inline_context,
-        )
+        with user_keys.using(request_keys):
+            result = query_text_rag(
+                question=safe_question,
+                user_id=safe_user_id,
+                canvas_id=safe_canvas_id,
+                top_k=safe_top_k,
+                source_filters=selected_sources,
+                chat_history=history,
+                inline_context=inline_context,
+            )
+
+    except UserKeyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
     except GeminiQuotaError as error:
         raise HTTPException(status_code=429, detail=quota_error_message(error))
 
     except Exception as error:
+        if request_keys.get("gemini_key") and _looks_like_bad_key(error):
+            raise HTTPException(status_code=400, detail=OWN_GEMINI_KEY_REJECTED)
+
         print(
             "[TEXT RAG ERROR] "
             f"user={safe_user_id} "
@@ -378,12 +395,24 @@ async def query_text_endpoint(
         "sources": sources,
     }
 
+OWN_GEMINI_KEY_REJECTED = (
+    "Your Gemini API key was rejected by Google. Check it in Settings → AI keys, "
+    "or remove it to use the NEXO default."
+)
+
+
+def _looks_like_bad_key(error: Exception) -> bool:
+    text = str(error)
+    return "HTTP 401" in text or "HTTP 403" in text or "API key not valid" in text
+
+
 @app.post(
     "/ingest",
     summary="Upload and index a document (PDF, Office, CSV, text, code)",
     dependencies=[Depends(require_api_key)],
 )
 async def ingest_document(
+    request: Request,
     file: UploadFile = File(...),
     user_id: str = Form(...),
     canvas_id: str = Form("default"),
@@ -393,6 +422,7 @@ async def ingest_document(
     safe_user_id = user_id.strip()
     safe_canvas_id = canvas_id.strip() or "default"
     safe_job_id = job_id.strip() if ingest_progress.valid_job_id(job_id.strip()) else ""
+    request_keys = user_keys.from_headers(request.headers)
 
     if not safe_user_id:
         raise HTTPException(
@@ -432,12 +462,14 @@ async def ingest_document(
                 # Pipeline steps report progress to this job (see ingest_progress.py).
                 ingest_progress.bind(safe_job_id or None)
                 try:
-                    return index_document_file(
-                        pdf_path=str(tmp_path),
-                        user_id=safe_user_id,
-                        canvas_id=safe_canvas_id,
-                        ocr_mode=ocr_mode,
-                    )
+                    # The uploader's own Gemini key (if any) pays for the embeddings.
+                    with user_keys.using(request_keys):
+                        return index_document_file(
+                            pdf_path=str(tmp_path),
+                            user_id=safe_user_id,
+                            canvas_id=safe_canvas_id,
+                            ocr_mode=ocr_mode,
+                        )
                 finally:
                     ingest_progress.bind(None)
 
@@ -509,6 +541,9 @@ async def ingest_document(
 
         if safe_job_id:
             ingest_progress.set_stage(safe_job_id, "error")
+
+        if request_keys.get("gemini_key") and _looks_like_bad_key(error):
+            raise HTTPException(status_code=400, detail=OWN_GEMINI_KEY_REJECTED)
 
         print("========== INGEST FAILED ==========")
         print(f"file: {file.filename if file else 'unknown'}")

@@ -7,6 +7,8 @@ import mimetypes
 import requests
 from dotenv import load_dotenv
 
+import user_keys
+
 
 ENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(ENV_PATH)
@@ -26,6 +28,114 @@ GEMINI_API_URL = (
 
 class GeminiAPIError(RuntimeError):
     """Gemini API request failed."""
+
+
+class UserKeyError(GeminiAPIError):
+    """The user's own API key was rejected or their provider failed."""
+
+
+PROVIDER_NAMES = {"gemini": "Gemini", "openai": "OpenAI", "anthropic": "Claude (Anthropic)"}
+
+
+def _gemini_url(model: str = "") -> str:
+    return (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model or GEMINI_MODEL}:generateContent"
+    )
+
+
+def _raise_user_provider_error(provider: str, response: requests.Response) -> None:
+    name = PROVIDER_NAMES.get(provider, provider)
+    message = _read_error_message(response)
+    if response.status_code in (401, 403):
+        raise UserKeyError(
+            f"Your {name} API key was rejected ({response.status_code}). "
+            "Check it in Settings → AI keys, or switch back to the NEXO default."
+        )
+    if response.status_code == 429:
+        raise UserKeyError(
+            f"Your {name} account hit its rate limit or has no credit left. "
+            f"Details: {message}"
+        )
+    raise UserKeyError(f"{name} returned HTTP {response.status_code}: {message}")
+
+
+def _generate_openai(prompt, system_instruction, temperature, max_output_tokens, key, model):
+    messages = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction.strip()})
+    messages.append({"role": "user", "content": prompt.strip()})
+
+    payload = {
+        "model": model or os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini"),
+        "messages": messages,
+        # Reasoning models spend part of the budget thinking.
+        "max_completion_tokens": max(max_output_tokens * 2, 4096),
+        "temperature": temperature,
+    }
+
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=120,
+            )
+        except requests.RequestException as error:
+            raise UserKeyError(f"Could not reach OpenAI: {error}") from error
+
+        # Some models only accept the default temperature.
+        if response.status_code == 400 and attempt == 0 and "temperature" in response.text:
+            payload.pop("temperature", None)
+            continue
+        break
+
+    if not response.ok:
+        _raise_user_provider_error("openai", response)
+
+    data = response.json()
+    choices = data.get("choices") or []
+    answer = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+    if not answer:
+        raise UserKeyError("OpenAI returned an empty answer.")
+    return answer
+
+
+def _generate_anthropic(prompt, system_instruction, temperature, max_output_tokens, key, model):
+    payload = {
+        "model": model or os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-sonnet-4-5"),
+        "max_tokens": max(max_output_tokens, 2048),
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt.strip()}],
+    }
+    if system_instruction:
+        payload["system"] = system_instruction.strip()
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=120,
+        )
+    except requests.RequestException as error:
+        raise UserKeyError(f"Could not reach Anthropic: {error}") from error
+
+    if not response.ok:
+        _raise_user_provider_error("anthropic", response)
+
+    data = response.json()
+    answer = "\n".join(
+        block.get("text", "") for block in data.get("content") or [] if block.get("type") == "text"
+    ).strip()
+    if not answer:
+        raise UserKeyError("Claude returned an empty answer.")
+    return answer
 
 
 def _read_error_message(response: requests.Response) -> str:
@@ -94,15 +204,30 @@ def generate_text(
 
     The API key is sent through a request header, so it will not
     appear inside the URL or normal error output.
-    """
 
-    if not GEMINI_API_KEY:
-        raise GeminiAPIError(
-            f"GEMINI_API_KEY was not found in {ENV_PATH}"
-        )
+    If the user connected their own key (Settings → AI keys), the answer
+    comes from their provider: OpenAI, Claude, or Gemini on their key.
+    """
 
     if not prompt or not prompt.strip():
         raise ValueError("Prompt cannot be empty.")
+
+    provider, user_key, user_model = user_keys.answer_settings()
+
+    if provider == "openai" and user_key:
+        return _generate_openai(prompt, system_instruction, temperature, max_output_tokens, user_key, user_model)
+
+    if provider == "anthropic" and user_key:
+        return _generate_anthropic(prompt, system_instruction, temperature, max_output_tokens, user_key, user_model)
+
+    own_gemini = provider == "gemini" and bool(user_key)
+    api_key = user_key if own_gemini else GEMINI_API_KEY
+    api_url = _gemini_url(user_model) if own_gemini else GEMINI_API_URL
+
+    if not api_key:
+        raise GeminiAPIError(
+            f"GEMINI_API_KEY was not found in {ENV_PATH}"
+        )
 
     payload = {
         "contents": [
@@ -132,10 +257,10 @@ def generate_text(
 
     try:
         response = requests.post(
-            GEMINI_API_URL,
+            api_url,
             headers={
                 "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY,
+                "x-goog-api-key": api_key,
             },
             json=payload,
             timeout=90,
@@ -150,6 +275,9 @@ def generate_text(
         ) from error
 
     if not response.ok:
+        if own_gemini:
+            _raise_user_provider_error("gemini", response)
+
         message = _read_error_message(response)
 
         raise GeminiAPIError(
@@ -170,7 +298,9 @@ def generate_image(
     Send an image and text prompt to Gemini.
     """
 
-    if not GEMINI_API_KEY:
+    image_key = user_keys.gemini_key(GEMINI_API_KEY)
+
+    if not image_key:
         raise GeminiAPIError(
             f"GEMINI_API_KEY was not found in {ENV_PATH}"
         )
@@ -228,7 +358,7 @@ def generate_image(
             GEMINI_API_URL,
             headers={
                 "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY,
+                "x-goog-api-key": image_key,
             },
             json=payload,
             timeout=120,
@@ -250,4 +380,4 @@ def generate_image(
             f"{response.status_code}: {message}"
         )
 
-    return _extract_answer(response.json())
+    return _extract_answer(response.json())
