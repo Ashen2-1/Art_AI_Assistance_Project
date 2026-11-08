@@ -4,6 +4,7 @@ from typing import Optional
 import base64
 import mimetypes
 
+import time
 import requests
 from dotenv import load_dotenv
 
@@ -44,26 +45,49 @@ def _gemini_url(model: str = "") -> str:
     )
 
 
+GEMINI_BUSY_CODES = {429, 500, 503, 504}
+GEMINI_RETRY_DELAYS = (3, 8, 15)
+
+
 def _post_gemini(model: str, api_key: str, payload: dict, timeout: int) -> requests.Response:
     """
-    POST to Gemini. If the chosen model was retired (HTTP 404, e.g. an old
-    model picked in Settings -> AI keys), retry once with NEXO's default
-    model so uploads and answers keep working.
+    POST to Gemini with two safety nets:
+    - busy (429/500/503/504, e.g. "model is experiencing high demand"):
+      wait and retry a few times, switching to NEXO's default model for
+      the later tries when another model was chosen;
+    - retired model (404, e.g. an old model picked in Settings -> AI keys):
+      retry with NEXO's default model.
     """
-    response = requests.post(
-        _gemini_url(model),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        json=payload,
-        timeout=timeout,
-    )
-    if response.status_code == 404 and model and model != GEMINI_MODEL:
-        print(f"[Gemini] model {model!r} unavailable (404); retrying with {GEMINI_MODEL!r}")
-        response = requests.post(
-            _gemini_url(GEMINI_MODEL),
+    models = [model or GEMINI_MODEL]
+    if models[0] != GEMINI_MODEL:
+        models.append(GEMINI_MODEL)
+
+    def send(name):
+        return requests.post(
+            _gemini_url(name),
             headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             json=payload,
             timeout=timeout,
         )
+
+    current = models[0]
+    response = send(current)
+    if response.status_code == 404 and len(models) > 1:
+        print(f"[Gemini] model {current!r} unavailable (404); using {GEMINI_MODEL!r}")
+        current = GEMINI_MODEL
+        response = send(current)
+
+    for attempt, delay in enumerate(GEMINI_RETRY_DELAYS, start=1):
+        if response.status_code not in GEMINI_BUSY_CODES:
+            break
+        # 429 from a quota that is used up will not clear in seconds.
+        if response.status_code == 429 and "quota" in (response.text or "").lower() and "exceeded" in (response.text or "").lower():
+            break
+        if attempt >= 2 and current != GEMINI_MODEL:
+            current = GEMINI_MODEL
+        print(f"[Gemini] busy ({response.status_code}); retry {attempt}/{len(GEMINI_RETRY_DELAYS)} in {delay}s with {current!r}")
+        time.sleep(delay)
+        response = send(current)
     return response
 
 
@@ -395,7 +419,7 @@ def generate_image(
             f"{response.status_code}: {message}"
         )
 
-    return _extract_answer(response.json())
+    return _extract_answer(response.json())
 
 
 def generate_multimodal(
