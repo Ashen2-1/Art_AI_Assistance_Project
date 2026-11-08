@@ -1,6 +1,9 @@
 import math
 import os
+import re
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import List, Optional
 
@@ -44,12 +47,100 @@ BATCH_EMBEDDING_API_URL = (
 # the per-minute token limit (it was 30K TPM on our free tier).
 BATCH_SIZE = max(
     1,
-    min(100, int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", "50"))),
+    min(100, int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", "45"))),
 )
+
+
+# Free-tier Gemini counts EVERY text inside a batch as one request
+# against the per-minute limit (it was 100/min for embeddings). We pace
+# ourselves below that so large documents slow down instead of failing.
+ITEMS_PER_MINUTE = max(
+    1,
+    int(os.getenv("GEMINI_EMBEDDING_ITEMS_PER_MINUTE", "90")),
+)
+
+# A batch can never be larger than what one minute allows.
+BATCH_SIZE = min(BATCH_SIZE, ITEMS_PER_MINUTE)
+
+MAX_RETRY_WAIT_SECONDS = 70
 
 
 class GeminiEmbeddingError(RuntimeError):
     """Gemini Embedding request failed."""
+
+
+class GeminiQuotaError(GeminiEmbeddingError):
+    """
+    The Gemini quota is exhausted.
+    daily=True means the per-day limit: retrying today will not help.
+    """
+
+    def __init__(self, message: str, daily: bool = False):
+        super().__init__(message)
+        self.daily = daily
+
+
+class _MinuteWindow:
+    """Thread-safe sliding 60-second budget shared by ingestion and queries."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.events = deque()  # (timestamp, item_count)
+        self.lock = threading.Lock()
+
+    def acquire(self, count: int) -> None:
+        count = min(count, self.limit)
+
+        while True:
+            with self.lock:
+                now = time.monotonic()
+
+                while self.events and now - self.events[0][0] >= 60:
+                    self.events.popleft()
+
+                used = sum(items for _, items in self.events)
+
+                if used + count <= self.limit:
+                    self.events.append((now, count))
+                    return
+
+                wait = 60 - (now - self.events[0][0]) + 0.5
+
+            print(f"[Embedding] Pacing for the per-minute quota: waiting {wait:.0f}s...")
+            time.sleep(max(0.5, wait))
+
+
+_minute_window = _MinuteWindow(ITEMS_PER_MINUTE)
+
+
+def _retry_delay_seconds(response: "requests.Response") -> Optional[float]:
+    """Read Retry-After or Google's RetryInfo.retryDelay (e.g. "41s")."""
+
+    header = response.headers.get("Retry-After")
+
+    try:
+        if header is not None:
+            return float(header)
+    except ValueError:
+        pass
+
+    try:
+        details = response.json().get("error", {}).get("details", [])
+    except ValueError:
+        return None
+
+    for detail in details:
+        delay = str(detail.get("retryDelay", ""))
+        match = re.match(r"^([\d.]+)s$", delay)
+        if match:
+            return float(match.group(1))
+
+    return None
+
+
+def _is_daily_quota(message: str) -> bool:
+    lowered = message.lower()
+    return "perday" in lowered or "per day" in lowered or "requests_per_day" in lowered
 
 
 def normalize_vector(
@@ -157,83 +248,25 @@ def embed_text(
     ):
         payload["title"] = title.strip()
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                EMBEDDING_API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": GEMINI_API_KEY,
-                },
-                json=payload,
-                timeout=60,
-            )
-        except requests.Timeout as error:
-            if attempt == max_retries - 1:
-                raise GeminiEmbeddingError(
-                    "Gemini Embedding request timed out."
-                ) from error
+    del max_retries  # retries and quota pacing live in _post_with_retries
 
-            time.sleep(2 ** attempt)
-            continue
+    data = _post_with_retries(EMBEDDING_API_URL, payload, item_count=1)
 
-        except requests.RequestException as error:
-            if attempt == max_retries - 1:
-                raise GeminiEmbeddingError(
-                    "Could not connect to Gemini Embedding."
-                ) from error
+    vector = data.get("embedding", {}).get("values", [])
 
-            time.sleep(2 ** attempt)
-            continue
-
-        if response.ok:
-            data = response.json()
-
-            vector = (
-                data.get("embedding", {})
-                .get("values", [])
-            )
-
-            if not vector:
-                raise GeminiEmbeddingError(
-                    "Gemini returned no embedding values."
-                )
-
-            if len(vector) != EMBEDDING_DIM:
-                raise GeminiEmbeddingError(
-                    "Unexpected embedding dimension: "
-                    f"expected {EMBEDDING_DIM}, "
-                    f"received {len(vector)}."
-                )
-
-            return normalize_vector(vector)
-
-        # Retry temporary quota/server errors
-        if (
-            response.status_code == 429
-            or response.status_code >= 500
-        ):
-            if attempt < max_retries - 1:
-                wait_seconds = 2 ** attempt
-
-                print(
-                    "[Embedding] Temporary API error. "
-                    f"Retrying in {wait_seconds} seconds..."
-                )
-
-                time.sleep(wait_seconds)
-                continue
-
-        message = _read_error_message(response)
-
+    if not vector:
         raise GeminiEmbeddingError(
-            f"Gemini Embedding returned HTTP "
-            f"{response.status_code}: {message}"
+            "Gemini returned no embedding values."
         )
 
-    raise GeminiEmbeddingError(
-        "Gemini Embedding request failed."
-    )
+    if len(vector) != EMBEDDING_DIM:
+        raise GeminiEmbeddingError(
+            "Unexpected embedding dimension: "
+            f"expected {EMBEDDING_DIM}, "
+            f"received {len(vector)}."
+        )
+
+    return normalize_vector(vector)
 
 
 def embed_document(
@@ -267,14 +300,20 @@ def embed_query(
 def _post_with_retries(
     url: str,
     payload: dict,
-    max_retries: int = 5,
+    item_count: int = 1,
+    max_retries: int = 6,
 ) -> dict:
     """
-    POST to Gemini with exponential backoff on timeouts, 429 and 5xx.
-    A Retry-After header from a 429 response is respected.
+    POST to Gemini, staying under the per-minute quota.
+
+    - Waits for room in the shared 60 s budget before every call.
+    - On 429 waits as long as Google asks (retryDelay), up to 70 s.
+    - A per-DAY quota error is raised at once (retrying cannot help).
     """
 
     for attempt in range(max_retries):
+        _minute_window.acquire(item_count)
+
         try:
             response = requests.post(
                 url,
@@ -297,29 +336,35 @@ def _post_with_retries(
         if response.ok:
             return response.json()
 
-        if (
-            response.status_code == 429
-            or response.status_code >= 500
-        ) and attempt < max_retries - 1:
-            retry_after = response.headers.get("Retry-After")
+        message = _read_error_message(response)
 
-            try:
-                wait_seconds = float(retry_after)
-            except (TypeError, ValueError):
-                wait_seconds = min(60, 2 ** (attempt + 1))
+        if response.status_code == 429:
+            if _is_daily_quota(message):
+                raise GeminiQuotaError(message, daily=True)
+
+            if attempt == max_retries - 1:
+                raise GeminiQuotaError(message, daily=False)
+
+            wait_seconds = min(
+                MAX_RETRY_WAIT_SECONDS,
+                (_retry_delay_seconds(response) or 20 * (attempt + 1)) + 1,
+            )
 
             print(
-                f"[Embedding] HTTP {response.status_code}. "
-                f"Retrying in {wait_seconds:.0f}s "
+                f"[Embedding] Quota hit (429). Waiting {wait_seconds:.0f}s "
                 f"(attempt {attempt + 1}/{max_retries})..."
             )
 
             time.sleep(wait_seconds)
             continue
 
+        if response.status_code >= 500 and attempt < max_retries - 1:
+            time.sleep(min(30, 2 ** (attempt + 1)))
+            continue
+
         raise GeminiEmbeddingError(
             f"Gemini Embedding returned HTTP "
-            f"{response.status_code}: {_read_error_message(response)}"
+            f"{response.status_code}: {message}"
         )
 
     raise GeminiEmbeddingError("Gemini Embedding request failed.")
@@ -347,6 +392,7 @@ def _embed_batch(
     data = _post_with_retries(
         BATCH_EMBEDDING_API_URL,
         {"requests": requests_payload},
+        item_count=len(texts),
     )
 
     embeddings = data.get("embeddings") or []

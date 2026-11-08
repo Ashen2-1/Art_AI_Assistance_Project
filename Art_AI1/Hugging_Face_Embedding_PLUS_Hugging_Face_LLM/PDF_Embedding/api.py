@@ -39,6 +39,7 @@ from document_pipeline import (
 # Imported under another name: the /ingest endpoint below is itself
 # called ingest_document, and would otherwise shadow this function.
 from embed_pipeline import ingest_document as index_document_file
+from gemini_embedding import GeminiQuotaError
 from rag_query import query_general, query_text_rag
 
 
@@ -91,6 +92,20 @@ def normalize_identity(
         )
 
     return safe_user_id, safe_canvas_id
+
+
+def quota_error_message(error: "GeminiQuotaError") -> str:
+    if error.daily:
+        return (
+            "The AI service has used today's free Gemini quota. The file is saved, "
+            "but it can only be indexed after the quota resets (or after billing is "
+            "enabled on the Gemini API key)."
+        )
+
+    return (
+        "The AI service is busy (Gemini per-minute limit). Please wait about a "
+        "minute and try again."
+    )
 
 
 def parse_chat_history(chat_history: str):
@@ -312,6 +327,9 @@ async def query_text_endpoint(
             inline_context=inline_context,
         )
 
+    except GeminiQuotaError as error:
+        raise HTTPException(status_code=429, detail=quota_error_message(error))
+
     except Exception as error:
         print(
             "[TEXT RAG ERROR] "
@@ -449,6 +467,11 @@ async def ingest_document(
 
     except HTTPException:
         raise
+
+    except GeminiQuotaError as error:
+        print(f"[INGEST QUOTA] {original_filename}: daily={error.daily} {error}")
+
+        raise HTTPException(status_code=429, detail=quota_error_message(error))
 
     except (UnsupportedDocumentError, ValueError) as error:
         # Clear, user-facing problems (unreadable file, legacy format, ...).
