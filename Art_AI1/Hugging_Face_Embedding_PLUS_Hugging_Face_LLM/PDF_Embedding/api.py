@@ -36,7 +36,9 @@ from document_pipeline import (
     UnsupportedDocumentError,
     parse_location,
 )
-from embed_pipeline import ingest_document
+# Imported under another name: the /ingest endpoint below is itself
+# called ingest_document, and would otherwise shadow this function.
+from embed_pipeline import ingest_document as index_document_file
 from rag_query import query_general, query_text_rag
 
 
@@ -406,7 +408,7 @@ async def ingest_document(
             tmp_path.write_bytes(file_content)
 
             def run_ingest():
-                return ingest_document(
+                return index_document_file(
                     pdf_path=str(tmp_path),
                     user_id=safe_user_id,
                     canvas_id=safe_canvas_id,
