@@ -26,11 +26,17 @@ import uvicorn
 
 from db import (
     delete_source as db_delete_source,
+    get_source_chunks,
     get_stats,
     init_db,
     list_sources,
 )
-from embed_pipeline import ingest_pdf
+from document_pipeline import (
+    SUPPORTED_EXTENSIONS,
+    UnsupportedDocumentError,
+    parse_location,
+)
+from embed_pipeline import ingest_document
 from rag_query import query_general, query_text_rag
 
 
@@ -320,11 +326,16 @@ async def query_text_endpoint(
     sources = []
 
     for index, chunk in enumerate(result.get("chunks", [])):
+        chunk_text = str(chunk.get("text", ""))
+
         sources.append(
             {
                 "citation_id": f"S{index + 1}",
                 "file": chunk.get("source"),
                 "chunk": int(chunk.get("chunk_idx", 0)) + 1,
+                "chunk_index": int(chunk.get("chunk_idx", 0)),
+                # Where the passage is: page / slide / section / sheet rows / lines.
+                "location": parse_location(chunk_text),
                 "similarity": round(
                     float(chunk.get("score", 0)),
                     4,
@@ -348,7 +359,7 @@ async def query_text_endpoint(
 
 @app.post(
     "/ingest",
-    summary="Upload and index a PDF document",
+    summary="Upload and index a document (PDF, Office, CSV, text, code)",
     dependencies=[Depends(require_api_key)],
 )
 async def ingest_document(
@@ -370,10 +381,13 @@ async def ingest_document(
         file.filename or "uploaded.pdf"
     ).name
 
-    if not original_filename.lower().endswith(".pdf"):
+    if Path(original_filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are currently accepted for AI indexing.",
+            detail=(
+                "This file type cannot be read by the AI yet. Supported: PDF, Word, "
+                "PowerPoint, Excel, CSV, text, Markdown, code and Jupyter notebooks."
+            ),
         )
 
     if ocr_mode not in ("printed", "cursive"):
@@ -392,7 +406,7 @@ async def ingest_document(
             tmp_path.write_bytes(file_content)
 
             def run_ingest():
-                return ingest_pdf(
+                return ingest_document(
                     pdf_path=str(tmp_path),
                     user_id=safe_user_id,
                     canvas_id=safe_canvas_id,
@@ -434,6 +448,12 @@ async def ingest_document(
     except HTTPException:
         raise
 
+    except (UnsupportedDocumentError, ValueError) as error:
+        # Clear, user-facing problems (unreadable file, legacy format, ...).
+        print(f"[INGEST REJECTED] {original_filename}: {error}")
+
+        raise HTTPException(status_code=422, detail=str(error))
+
     except Exception as error:
         print(
             f"[INGEST ERROR] "
@@ -452,6 +472,45 @@ async def ingest_document(
             status_code=500,
             detail=f"Document ingestion failed: {error}",
         )
+
+@app.get(
+    "/source/chunks",
+    dependencies=[Depends(require_api_key)],
+)
+async def source_chunks(
+    user_id: str,
+    source: str,
+    canvas_id: str = "default",
+):
+    """
+    All chunks of one source, in order, for the source viewer.
+    Express passes the authenticated user_id; this service is only
+    reachable with the internal API key.
+    """
+
+    safe_user_id = user_id.strip()
+
+    if not safe_user_id or not source.strip():
+        raise HTTPException(status_code=400, detail="user_id and source are required.")
+
+    rows = get_source_chunks(
+        user_id=safe_user_id,
+        canvas_id=canvas_id.strip() or "default",
+        source=source,
+    )
+
+    return {
+        "source": source,
+        "chunks": [
+            {
+                "chunk_index": row["chunk_index"],
+                "location": parse_location(row["content"]),
+                "text": row["content"],
+            }
+            for row in rows
+        ],
+    }
+
 
 @app.get(
     "/sources",
@@ -527,4 +586,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=False,
-    )
+    )

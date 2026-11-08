@@ -15,7 +15,7 @@ sys.path.insert(
     str(Path(__file__).parent),
 )
 
-from pdf_pipeline import process_pdf
+from document_pipeline import process_document
 from db import (
     init_db,
     insert_chunks,
@@ -108,9 +108,10 @@ def ingest_pdf(
     chunk_overlap: int = CHUNK_OVERLAP,
 ) -> int:
     """
-    Extract, chunk, embed and store one PDF.
+    Extract, chunk, embed and store one document (any supported type;
+    the name ingest_pdf is kept so existing imports keep working).
 
-    Re-ingesting a PDF with the same filename replaces its
+    Re-ingesting a file with the same filename replaces its
     existing Gemini chunks.
     """
 
@@ -124,7 +125,7 @@ def ingest_pdf(
 
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(
-            f"PDF not found: {pdf_path}"
+            f"File not found: {pdf_path}"
         )
 
     source_name = Path(pdf_path).name
@@ -147,10 +148,14 @@ def ingest_pdf(
     )
 
     # Step 1: extract and chunk
-    chunks = process_pdf(
+    # PDF, Word, PowerPoint, Excel, CSV, text and code files.
+    # chunk_overlap is unused: chunks follow page/slide/section
+    # boundaries instead of overlapping windows.
+    del chunk_overlap
+
+    chunks = process_document(
         pdf_path,
         chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
         ocr_mode=ocr_mode,
     )
 
@@ -202,6 +207,10 @@ def ingest_pdf(
     )
 
     return stored_count
+
+
+# Clearer name for new code.
+ingest_document = ingest_pdf
 
 
 def get_db_stats(
@@ -299,4 +308,4 @@ if __name__ == "__main__":
     print(
         f"Sources: {stats['sources']}"
     )
-    print("=" * 60)
+    print("=" * 60)
