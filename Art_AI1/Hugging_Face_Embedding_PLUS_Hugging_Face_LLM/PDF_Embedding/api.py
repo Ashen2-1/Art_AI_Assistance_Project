@@ -42,6 +42,8 @@ from document_pipeline import (
 from embed_pipeline import ingest_document as index_document_file
 from gemini_embedding import GeminiQuotaError
 import ingest_progress
+import detective
+from image_tools import IMAGE_EXTENSIONS, prepare_image
 import user_keys
 from gemini_client import UserKeyError
 from rag_query import query_general, query_text_rag
@@ -439,7 +441,7 @@ async def ingest_document(
             status_code=400,
             detail=(
                 "This file type cannot be read by the AI yet. Supported: PDF, Word, "
-                "PowerPoint, Excel, CSV, text, Markdown, code and Jupyter notebooks."
+                "PowerPoint, Excel, CSV, text, Markdown, code, Jupyter notebooks and images."
             ),
         )
 
@@ -555,6 +557,89 @@ async def ingest_document(
             status_code=500,
             detail=f"Document ingestion failed: {error}",
         )
+
+@app.post(
+    "/detective/analyze",
+    dependencies=[Depends(require_api_key)],
+)
+async def detective_analyze(
+    request: Request,
+    images: List[UploadFile] = File(...),
+    user_id: str = Form(...),
+    canvas_id: str = Form("default"),
+    question: str = Form(""),
+    source_filters: str = Form("[]"),
+):
+    """Photo Detective: one image (identify) or two (compare) against the workspace sources."""
+
+    if not 1 <= len(images) <= 2:
+        raise HTTPException(status_code=400, detail="Send one image to identify or two to compare.")
+
+    safe_user_id = user_id.strip()
+    if not safe_user_id:
+        raise HTTPException(status_code=400, detail="user_id is required.")
+
+    request_keys = user_keys.from_headers(request.headers)
+    selected = parse_source_filters(source_filters=source_filters, source_filter=None)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="nexo_detective_") as temp_dir:
+            paths, names = [], []
+            for index, upload in enumerate(images):
+                name = Path(upload.filename or f"image-{index + 1}.jpg").name
+                if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
+                    raise HTTPException(status_code=400, detail=f"{name} is not a supported image.")
+                raw = Path(temp_dir) / f"raw-{index}{Path(name).suffix.lower()}"
+                raw.write_bytes(await upload.read())
+                paths.append(prepare_image(str(raw), temp_dir))
+                names.append(name)
+
+            def run():
+                with user_keys.using(request_keys):
+                    return detective.analyze(
+                        image_paths=paths,
+                        image_names=names,
+                        user_id=safe_user_id,
+                        canvas_id=canvas_id.strip() or "default",
+                        question=question[:1000],
+                        source_filters=selected,
+                    )
+
+            result = await run_in_threadpool(run)
+
+    except HTTPException:
+        raise
+    except UserKeyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except GeminiQuotaError as error:
+        raise HTTPException(status_code=429, detail=quota_error_message(error))
+    except Exception as error:
+        if request_keys.get("gemini_key") and _looks_like_bad_key(error):
+            raise HTTPException(status_code=400, detail=OWN_GEMINI_KEY_REJECTED)
+        print(f"[DETECTIVE ERROR] user={safe_user_id} {type(error).__name__}: {error}")
+        raise HTTPException(status_code=500, detail=f"The Photo Detective could not finish: {error}")
+
+    sources = [
+        {
+            "citation_id": f"S{row['citation_id']}",
+            "file": row.get("source"),
+            "chunk": int(row.get("chunk_idx", 0)) + 1,
+            "chunk_index": int(row.get("chunk_idx", 0)),
+            "location": parse_location(str(row.get("text", ""))),
+            "similarity": round(float(row.get("score", 0)), 4),
+            "preview": str(row.get("text", ""))[:800].replace("\n", " "),
+            "text": str(row.get("text", "")),
+        }
+        for row in result["evidence"]
+    ]
+
+    return {
+        "mode": result["mode"],
+        "observations": result["observations"],
+        "report": result["report"],
+        "sources": sources,
+    }
+
 
 @app.get(
     "/ingest/progress/{job_id}",

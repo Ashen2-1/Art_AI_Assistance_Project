@@ -35,6 +35,8 @@ POWERPOINT_EXTENSIONS = {".pptx"}
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 CSV_EXTENSIONS = {".csv", ".tsv"}
 NOTEBOOK_EXTENSIONS = {".ipynb"}
+# Photographs, paintings, drawings: indexed through a vision description.
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
 # Legacy Office formats need LibreOffice to convert first.
 LEGACY_CONVERSIONS = {
@@ -65,6 +67,7 @@ SUPPORTED_EXTENSIONS = (
     | EXCEL_EXTENSIONS
     | CSV_EXTENSIONS
     | NOTEBOOK_EXTENSIONS
+    | IMAGE_EXTENSIONS
     | TEXT_EXTENSIONS
     | set(LEGACY_CONVERSIONS)
 )
@@ -500,6 +503,16 @@ def process_document(
             f"{extension or 'This'} files are not supported for AI reading yet."
         )
 
+    if extension in IMAGE_EXTENSIONS:
+        from image_tools import describe_for_index
+
+        description = describe_for_index(str(path))
+        if not description:
+            raise ValueError(f"No description could be made for {path.name}.")
+        chunks = chunk_sections([("Image", description)], chunk_size)
+        print(f"[Document Pipeline] {path.name}: image described in {len(chunks)} chunks")
+        return chunks
+
     if extension in PDF_EXTENSIONS:
         from pdf_pipeline import process_pdf
 
@@ -539,6 +552,7 @@ def process_document(
 
 _LOCATION_PATTERNS = [
     (re.compile(r"^\[Page\s+(\d+)\]"), "page"),
+    (re.compile(r"^\[Image\]"), "image"),
     (re.compile(r"^\[Slide\s+(\d+)\]"), "slide"),
     (re.compile(r"^\[Section\s+(\d+)(?::\s*(.*?))?\]"), "section"),
     (re.compile(r"^\[Sheet\s+(.+?),\s*rows\s+(\d+)-(\d+)\]"), "sheet"),
@@ -591,6 +605,8 @@ def parse_location(chunk_text: str) -> dict:
             }
         if kind == "cell":
             return {"type": "cell", "cell": int(match.group(1)), "label": label}
+        if kind == "image":
+            return {"type": "image", "label": "Image description"}
 
     return {"type": "unknown", "label": ""}
 
