@@ -326,6 +326,54 @@ def list_sources(
         conn.close()
 
 
+def get_source_chunks(
+    user_id: str,
+    canvas_id: str,
+    source: str,
+    limit: int = 2000,
+) -> List[dict]:
+    """
+    Return every stored chunk of one source in reading order.
+
+    Used by the source viewer to show the cited passage in context.
+    Always filtered by user_id and canvas_id so one user can never
+    read another user's document.
+    """
+
+    if not user_id:
+        raise ValueError("user_id is required when reading chunks.")
+
+    conn = get_conn()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT chunk_index, content
+                FROM pdf_chunks_gemini
+                WHERE user_id = %s
+                  AND canvas_id = %s
+                  AND source = %s
+                ORDER BY chunk_index
+                LIMIT %s;
+                """,
+                (
+                    user_id,
+                    canvas_id or "default",
+                    source,
+                    limit,
+                ),
+            )
+
+            return [
+                {"chunk_index": row[0], "content": row[1]}
+                for row in cur.fetchall()
+            ]
+
+    finally:
+        conn.close()
+
+
 def get_stats(
     user_id: str,
     canvas_id: str = "default",
@@ -535,4 +583,4 @@ if __name__ == "__main__":
     print(f"User         : {cli_user_id}")
     print(f"Canvas       : {cli_canvas_id}")
     print(f"Total chunks : {stats['total_chunks']}")
-    print(f"Sources      : {stats['sources'] or 'none'}")
+    print(f"Sources      : {stats['sources'] or 'none'}")
