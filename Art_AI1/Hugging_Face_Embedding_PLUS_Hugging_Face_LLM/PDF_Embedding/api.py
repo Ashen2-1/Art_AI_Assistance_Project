@@ -43,7 +43,7 @@ from embed_pipeline import ingest_document as index_document_file
 from gemini_embedding import GeminiQuotaError
 import ingest_progress
 import detective
-from image_tools import IMAGE_EXTENSIONS, prepare_image
+from image_tools import IMAGE_EXTENSIONS, crop_region, prepare_image
 import user_keys
 from gemini_client import UserKeyError
 from rag_query import query_general, query_text_rag
@@ -569,11 +569,24 @@ async def detective_analyze(
     canvas_id: str = Form("default"),
     question: str = Form(""),
     source_filters: str = Form("[]"),
+    focus: str = Form("[]"),
 ):
-    """Photo Detective: one image (identify) or two (compare) against the workspace sources."""
+    """
+    Photo Detective against the workspace sources:
+    1 image = identify, 2 = compare, 3-12 = group (who appears where).
+    focus: JSON list aligned with images, each null or
+           {"box": {"x","y","w","h"} as 0-1 fractions, "note": "the man on the left"}.
+    """
 
-    if not 1 <= len(images) <= 2:
-        raise HTTPException(status_code=400, detail="Send one image to identify or two to compare.")
+    if not 1 <= len(images) <= detective.MAX_IMAGES:
+        raise HTTPException(status_code=400, detail=f"Send between 1 and {detective.MAX_IMAGES} images.")
+
+    try:
+        focus_list = json.loads(focus or "[]")
+        if not isinstance(focus_list, list):
+            focus_list = []
+    except ValueError:
+        focus_list = []
 
     safe_user_id = user_id.strip()
     if not safe_user_id:
@@ -584,21 +597,27 @@ async def detective_analyze(
 
     try:
         with tempfile.TemporaryDirectory(prefix="nexo_detective_") as temp_dir:
-            paths, names = [], []
+            prepared = []
+            # Many images in one request: keep each smaller so the request stays fast.
+            max_side = 2048 if len(images) <= 2 else 1280 if len(images) <= 6 else 1024
             for index, upload in enumerate(images):
                 name = Path(upload.filename or f"image-{index + 1}.jpg").name
                 if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
                     raise HTTPException(status_code=400, detail=f"{name} is not a supported image.")
                 raw = Path(temp_dir) / f"raw-{index}{Path(name).suffix.lower()}"
                 raw.write_bytes(await upload.read())
-                paths.append(prepare_image(str(raw), temp_dir))
-                names.append(name)
+                item = {"path": prepare_image(str(raw), temp_dir, max_side=max_side), "name": name}
+                spec = focus_list[index] if index < len(focus_list) and isinstance(focus_list[index], dict) else {}
+                if isinstance(spec.get("box"), dict):
+                    item["focus_path"] = crop_region(str(raw), spec["box"], temp_dir)
+                if spec.get("note"):
+                    item["focus_note"] = str(spec["note"])[:200]
+                prepared.append(item)
 
             def run():
                 with user_keys.using(request_keys):
                     return detective.analyze(
-                        image_paths=paths,
-                        image_names=names,
+                        images=prepared,
                         user_id=safe_user_id,
                         canvas_id=canvas_id.strip() or "default",
                         question=question[:1000],
@@ -635,6 +654,7 @@ async def detective_analyze(
 
     return {
         "mode": result["mode"],
+        "labels": result.get("labels", []),
         "observations": result["observations"],
         "report": result["report"],
         "sources": sources,

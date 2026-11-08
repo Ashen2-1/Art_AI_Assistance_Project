@@ -47,16 +47,43 @@ def is_image(path: str) -> bool:
     return Path(path).suffix.lower() in IMAGE_EXTENSIONS
 
 
-def prepare_image(path: str, out_dir: str) -> str:
+def prepare_image(path: str, out_dir: str, max_side: int = MAX_SIDE) -> str:
     """Normalise to an RGB JPEG that the vision model accepts."""
     with Image.open(path) as image:
         image = ImageOps.exif_transpose(image)
         if getattr(image, "n_frames", 1) > 1:
             image.seek(0)
         image = image.convert("RGB")
-        image.thumbnail((MAX_SIDE, MAX_SIDE))
+        image.thumbnail((max_side, max_side))
         target = Path(out_dir) / f"{Path(path).stem}-prepared.jpg"
         image.save(target, "JPEG", quality=90)
+    return str(target)
+
+
+def crop_region(path: str, box: dict, out_dir: str, pad: float = 0.12) -> str:
+    """
+    Crop the region the researcher marked. box = {x, y, w, h} as fractions
+    (0-1) of the image. A little padding keeps hair, collars and hands.
+    """
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        x = max(0.0, min(1.0, float(box.get("x", 0))))
+        y = max(0.0, min(1.0, float(box.get("y", 0))))
+        w = max(0.01, min(1.0 - x, float(box.get("w", 1))))
+        h = max(0.01, min(1.0 - y, float(box.get("h", 1))))
+        left = max(0, int((x - w * pad) * width))
+        top = max(0, int((y - h * pad) * height))
+        right = min(width, int((x + w * (1 + pad)) * width))
+        bottom = min(height, int((y + h * (1 + pad)) * height))
+        region = image.crop((left, top, max(right, left + 8), max(bottom, top + 8)))
+        # Small faces benefit from upscaling before the vision model sees them.
+        if max(region.size) < 512:
+            factor = 512 / max(region.size)
+            region = region.resize((int(region.width * factor), int(region.height * factor)), Image.LANCZOS)
+        region.thumbnail((MAX_SIDE, MAX_SIDE))
+        target = Path(out_dir) / f"{Path(path).stem}-focus.jpg"
+        region.save(target, "JPEG", quality=92)
     return str(target)
 
 
