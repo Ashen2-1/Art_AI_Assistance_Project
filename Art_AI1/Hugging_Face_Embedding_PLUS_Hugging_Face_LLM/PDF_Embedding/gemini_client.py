@@ -381,3 +381,67 @@ def generate_image(
         )
 
     return _extract_answer(response.json())
+
+
+def generate_multimodal(
+    prompt: str,
+    image_paths: list,
+    system_instruction: Optional[str] = None,
+    temperature: float = 0.2,
+    max_output_tokens: int = 4096,
+    json_output: bool = False,
+) -> str:
+    """
+    One Gemini request with several images (e.g. two photographs to
+    compare). Uses the user's own Gemini key when connected
+    (Settings -> AI keys), otherwise NEXO's key.
+    """
+
+    provider, user_key, user_model = user_keys.answer_settings()
+    api_key = user_keys.gemini_key(GEMINI_API_KEY)
+    model = user_model if provider == "gemini" and user_model else GEMINI_MODEL
+    own_key = user_keys.using_own_gemini_key()
+
+    if not api_key:
+        raise GeminiAPIError(f"GEMINI_API_KEY was not found in {ENV_PATH}")
+
+    parts = []
+    for image_path in image_paths:
+        image_file = Path(image_path)
+        mime_type, _ = mimetypes.guess_type(image_file.name)
+        if not mime_type or not mime_type.startswith("image/"):
+            mime_type = "image/jpeg"
+        parts.append({
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": base64.b64encode(image_file.read_bytes()).decode("utf-8"),
+            }
+        })
+    parts.append({"text": prompt.strip()})
+
+    generation_config = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
+    if json_output:
+        generation_config["responseMimeType"] = "application/json"
+
+    payload = {"contents": [{"role": "user", "parts": parts}], "generationConfig": generation_config}
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction.strip()}]}
+
+    try:
+        response = requests.post(
+            _gemini_url(model),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            json=payload,
+            timeout=150,
+        )
+    except requests.Timeout as error:
+        raise GeminiAPIError("Gemini request timed out. Please try again.") from error
+    except requests.RequestException as error:
+        raise GeminiAPIError("Could not connect to the Gemini API.") from error
+
+    if not response.ok:
+        if own_key:
+            _raise_user_provider_error("gemini", response)
+        raise GeminiAPIError(f"Gemini API returned HTTP {response.status_code}: {_read_error_message(response)}")
+
+    return _extract_answer(response.json())
