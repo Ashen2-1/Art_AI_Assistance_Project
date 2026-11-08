@@ -10,6 +10,8 @@ from typing import List, Optional
 import requests
 from dotenv import load_dotenv
 
+from ingest_progress import report as report_progress
+
 
 ENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(ENV_PATH)
@@ -455,6 +457,8 @@ def embed_documents(
         os.getenv("GEMINI_EMBEDDING_BATCH_DELAY_SECONDS", "0")
     )
 
+    report_progress("embedding", 0, total)
+
     for start in range(0, total, BATCH_SIZE):
         batch = cleaned[start:start + BATCH_SIZE]
         end = start + len(batch)
@@ -464,6 +468,7 @@ def embed_documents(
         )
 
         embeddings.extend(_embed_batch(batch, title))
+        report_progress("embedding", end, total)
 
         if end < total and delay_seconds > 0:
             time.sleep(delay_seconds)

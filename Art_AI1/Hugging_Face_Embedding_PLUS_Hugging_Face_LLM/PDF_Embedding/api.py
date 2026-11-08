@@ -40,6 +40,7 @@ from document_pipeline import (
 # called ingest_document, and would otherwise shadow this function.
 from embed_pipeline import ingest_document as index_document_file
 from gemini_embedding import GeminiQuotaError
+import ingest_progress
 from rag_query import query_general, query_text_rag
 
 
@@ -387,9 +388,11 @@ async def ingest_document(
     user_id: str = Form(...),
     canvas_id: str = Form("default"),
     ocr_mode: str = Form("printed"),
+    job_id: str = Form(""),
 ):
     safe_user_id = user_id.strip()
     safe_canvas_id = canvas_id.strip() or "default"
+    safe_job_id = job_id.strip() if ingest_progress.valid_job_id(job_id.strip()) else ""
 
     if not safe_user_id:
         raise HTTPException(
@@ -426,12 +429,20 @@ async def ingest_document(
             tmp_path.write_bytes(file_content)
 
             def run_ingest():
-                return index_document_file(
-                    pdf_path=str(tmp_path),
-                    user_id=safe_user_id,
-                    canvas_id=safe_canvas_id,
-                    ocr_mode=ocr_mode,
-                )
+                # Pipeline steps report progress to this job (see ingest_progress.py).
+                ingest_progress.bind(safe_job_id or None)
+                try:
+                    return index_document_file(
+                        pdf_path=str(tmp_path),
+                        user_id=safe_user_id,
+                        canvas_id=safe_canvas_id,
+                        ocr_mode=ocr_mode,
+                    )
+                finally:
+                    ingest_progress.bind(None)
+
+            if safe_job_id:
+                ingest_progress.start(safe_job_id, safe_user_id, original_filename)
 
             print(
                 f"[INGEST START] "
@@ -441,6 +452,9 @@ async def ingest_document(
             )
 
             chunks_added = await run_in_threadpool(run_ingest)
+
+            if safe_job_id:
+                ingest_progress.set_stage(safe_job_id, "done", 1, 1)
 
             print(
                 f"[INGEST DONE] "
@@ -466,15 +480,21 @@ async def ingest_document(
         }
 
     except HTTPException:
+        if safe_job_id:
+            ingest_progress.set_stage(safe_job_id, "error")
         raise
 
     except GeminiQuotaError as error:
+        if safe_job_id:
+            ingest_progress.set_stage(safe_job_id, "error")
         print(f"[INGEST QUOTA] {original_filename}: daily={error.daily} {error}")
 
         raise HTTPException(status_code=429, detail=quota_error_message(error))
 
     except (UnsupportedDocumentError, ValueError) as error:
         # Clear, user-facing problems (unreadable file, legacy format, ...).
+        if safe_job_id:
+            ingest_progress.set_stage(safe_job_id, "error")
         print(f"[INGEST REJECTED] {original_filename}: {error}")
 
         raise HTTPException(status_code=422, detail=str(error))
@@ -487,6 +507,9 @@ async def ingest_document(
             f"{type(error).__name__}: {error}"
         )
 
+        if safe_job_id:
+            ingest_progress.set_stage(safe_job_id, "error")
+
         print("========== INGEST FAILED ==========")
         print(f"file: {file.filename if file else 'unknown'}")
         print(f"user_id: {user_id}")
@@ -497,6 +520,22 @@ async def ingest_document(
             status_code=500,
             detail=f"Document ingestion failed: {error}",
         )
+
+@app.get(
+    "/ingest/progress/{job_id}",
+    dependencies=[Depends(require_api_key)],
+)
+async def ingest_progress_endpoint(job_id: str, user_id: str):
+    """Progress of an /ingest request started with this job_id."""
+
+    job = ingest_progress.get(job_id, user_id.strip())
+
+    if not job:
+        # Not started yet (still uploading), finished long ago, or not yours.
+        return {"stage": "unknown", "percent": 0}
+
+    return job
+
 
 @app.get(
     "/source/chunks",

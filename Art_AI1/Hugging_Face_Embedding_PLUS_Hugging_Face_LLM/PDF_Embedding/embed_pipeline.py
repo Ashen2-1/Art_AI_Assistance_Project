@@ -16,6 +16,7 @@ sys.path.insert(
 )
 
 from document_pipeline import process_document
+from ingest_progress import report as report_progress
 from db import (
     init_db,
     insert_chunks,
@@ -153,6 +154,8 @@ def ingest_pdf(
     # boundaries instead of overlapping windows.
     del chunk_overlap
 
+    report_progress("reading", 0, 1)
+
     chunks = process_document(
         pdf_path,
         chunk_size=chunk_size,
@@ -182,6 +185,7 @@ def ingest_pdf(
         )
 
     # Step 3: PostgreSQL storage
+    report_progress("saving", 0, 1)
     init_db()
 
     stored_count = insert_chunks(
