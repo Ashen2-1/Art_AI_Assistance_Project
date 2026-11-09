@@ -27,6 +27,19 @@ GEMINI_MODEL = os.getenv(
 # A model name that does not exist falls back to GEMINI_MODEL (404 handling).
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-flash-latest").strip() or GEMINI_MODEL
 
+# ---- NEXO's default answers on Claude (Anthropic API) ----
+# With ANTHROPIC_API_KEY set, answers paid by NEXO (users without their own
+# key) are written by Claude: the fast model for chat, tools and quizzes,
+# the strong model for Photo Detective and AI reports. Embeddings stay on
+# Gemini. If Claude fails (credit used up, outage, timeout) the request
+# falls back to Gemini, so users never see an error because of it.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+NEXO_ANSWER_PROVIDER = os.getenv("NEXO_ANSWER_PROVIDER", "claude" if ANTHROPIC_API_KEY else "gemini").strip().lower()
+CLAUDE_FAST_MODEL = os.getenv("CLAUDE_FAST_MODEL", "claude-haiku-5-5").strip()
+CLAUDE_STRONG_MODEL = os.getenv("CLAUDE_STRONG_MODEL", "claude-sonnet-5-5").strip()
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+_claude_paused_until = 0.0  # after "credit used up": skip Claude for a while
+
 # Images are shrunk before upload: big scans are slow to send and to read,
 # and 1600 px is plenty to compare faces, clothes and studio backdrops.
 IMAGE_MAX_SIDE = int(os.getenv("GEMINI_IMAGE_MAX_SIDE", "1600"))
@@ -288,26 +301,61 @@ def _generate_compatible(provider, base_url, prompt, system_instruction, tempera
     return answer
 
 
-def _generate_anthropic(prompt, system_instruction, temperature, max_output_tokens, key, model):
+def _claude_request(key, model, content, system_instruction, max_tokens, timeout=120, effort=None):
+    """
+    One Messages API call. Returns the requests.Response.
+    No temperature/top_p: current Claude models reject them (HTTP 400) and
+    older ones work fine without. Thinking counts toward max_tokens, so
+    callers pass a generous limit.
+    """
     payload = {
-        "model": model or os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-sonnet-4-5"),
-        "max_tokens": max(max_output_tokens, 2048),
-        "temperature": temperature,
-        "messages": [{"role": "user", "content": prompt.strip()}],
+        "model": model,
+        "max_tokens": int(max_tokens),
+        "messages": [{"role": "user", "content": content}],
     }
     if system_instruction:
         payload["system"] = system_instruction.strip()
-
-    try:
+    if effort:
+        payload["output_config"] = {"effort": effort}
+    response = requests.post(
+        ANTHROPIC_URL,
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    # An older model may not know output_config: ask again without it.
+    if response.status_code == 400 and effort and "output_config" in (response.text or ""):
+        payload.pop("output_config", None)
         response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
+            ANTHROPIC_URL,
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
             json=payload,
-            timeout=120,
+            timeout=timeout,
+        )
+    return response
+
+
+def _claude_text(data: dict) -> str:
+    return "\n".join(
+        block.get("text", "") for block in data.get("content") or [] if block.get("type") == "text"
+    ).strip()
+
+
+def _claude_image_block(image_path) -> dict:
+    part = _image_part(image_path)["inlineData"]
+    mime = part["mimeType"] if part["mimeType"] in ("image/jpeg", "image/png", "image/webp", "image/gif") else "image/jpeg"
+    return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": part["data"]}}
+
+
+def _generate_anthropic(prompt, system_instruction, temperature, max_output_tokens, key, model):
+    """The user's own Claude key (Settings → AI keys)."""
+    try:
+        response = _claude_request(
+            key,
+            model or os.getenv("ANTHROPIC_DEFAULT_MODEL", CLAUDE_STRONG_MODEL),
+            prompt.strip(),
+            system_instruction,
+            max(max_output_tokens * 2, 4096),
         )
     except requests.RequestException as error:
         raise UserKeyError(f"Could not reach Anthropic: {error}") from error
@@ -315,12 +363,51 @@ def _generate_anthropic(prompt, system_instruction, temperature, max_output_toke
     if not response.ok:
         _raise_user_provider_error("anthropic", response)
 
-    data = response.json()
-    answer = "\n".join(
-        block.get("text", "") for block in data.get("content") or [] if block.get("type") == "text"
-    ).strip()
+    answer = _claude_text(response.json())
     if not answer:
         raise UserKeyError("Claude returned an empty answer.")
+    return answer
+
+
+def nexo_claude_enabled() -> bool:
+    return NEXO_ANSWER_PROVIDER == "claude" and bool(ANTHROPIC_API_KEY) and time.time() >= _claude_paused_until
+
+
+def _nexo_claude(content, system_instruction, max_output_tokens, heavy=False, timeout=None):
+    """
+    NEXO's own Claude key. Returns the answer, or None when Claude cannot
+    answer right now (the caller then uses Gemini).
+    """
+    global _claude_paused_until
+    if not nexo_claude_enabled():
+        return None
+    model = CLAUDE_STRONG_MODEL if heavy else CLAUDE_FAST_MODEL
+    try:
+        response = _claude_request(
+            ANTHROPIC_API_KEY,
+            model,
+            content,
+            system_instruction,
+            max(max_output_tokens * 2, 4096),
+            timeout=timeout or (150 if heavy else 90),
+            # Sonnet thinks hard by default; medium keeps Photo Detective quick.
+            effort="medium" if heavy else None,
+        )
+    except requests.RequestException as error:
+        print(f"[Claude] {model} unavailable ({type(error).__name__}); using Gemini")
+        return None
+    if not response.ok:
+        message = _read_error_message(response)
+        lowered = message.lower()
+        if response.status_code in (401, 403) or "credit" in lowered or "billing" in lowered:
+            # Key revoked or this month's credit used up: stop trying for 15 minutes.
+            _claude_paused_until = time.time() + 15 * 60
+        print(f"[Claude] {model} returned HTTP {response.status_code}: {message[:200]} — using Gemini")
+        return None
+    answer = _claude_text(response.json())
+    if not answer:
+        print(f"[Claude] {model} returned an empty answer (stop_reason={response.json().get('stop_reason')}); using Gemini")
+        return None
     return answer
 
 
@@ -417,6 +504,12 @@ def generate_text(
             "qwen", user_keys.qwen_base_url(user_keys.answer_endpoint()), prompt, system_instruction, temperature,
             max_output_tokens, user_key, user_model or os.getenv("QWEN_DEFAULT_MODEL", "qwen-plus"),
         )
+
+    # NEXO's default: Claude when configured, Gemini as the fallback.
+    if provider == "nexo":
+        answer = _nexo_claude(prompt.strip(), system_instruction, max_output_tokens, heavy=user_keys.heavy_task())
+        if answer:
+            return answer
 
     own_gemini = provider == "gemini" and bool(user_key)
     api_key = user_key if own_gemini else GEMINI_API_KEY
@@ -543,6 +636,26 @@ def generate_multimodal(
     """
 
     provider, user_key, user_model = user_keys.answer_settings()
+
+    # Photos on the user's own Claude key, or on NEXO's Claude (strong model).
+    if provider == "anthropic" and user_key:
+        content = [_claude_image_block(path) for path in image_paths] + [{"type": "text", "text": prompt.strip()}]
+        try:
+            response = _claude_request(user_key, user_model or CLAUDE_STRONG_MODEL, content, system_instruction, max(max_output_tokens * 2, 8192), timeout=180)
+        except requests.RequestException as error:
+            raise UserKeyError(f"Could not reach Anthropic: {error}") from error
+        if not response.ok:
+            _raise_user_provider_error("anthropic", response)
+        answer = _claude_text(response.json())
+        if answer:
+            return answer
+        raise UserKeyError("Claude returned an empty answer.")
+    if provider == "nexo":
+        content = [_claude_image_block(path) for path in image_paths] + [{"type": "text", "text": prompt.strip()}]
+        answer = _nexo_claude(content, system_instruction, max_output_tokens, heavy=True, timeout=180)
+        if answer:
+            return answer
+
     api_key = user_keys.gemini_key(GEMINI_API_KEY)
     model = user_model if provider == "gemini" and user_model else GEMINI_VISION_MODEL
     own_key = user_keys.using_own_gemini_key()
@@ -572,3 +685,49 @@ def generate_multimodal(
         raise GeminiAPIError(f"Gemini API returned HTTP {response.status_code}: {_read_error_message(response)}")
 
     return _extract_answer(response.json())
+
+
+SKETCH_READ_SYSTEM = (
+    "You read a researcher's handwritten notes and drawings (Apple Pencil / finger) so that an AI "
+    "assistant can search and use them. Be faithful: transcribe, do not invent or correct content."
+)
+
+SKETCH_READ_PROMPT = """Read this hand-drawn page.
+
+1. TEXT: transcribe all handwriting in reading order, in the language it is written in. Keep line breaks
+   and lists. Write maths in LaTeX between $...$ (inline) or $$...$$ (display). Mark unreadable words as [?].
+2. DRAWINGS: describe every diagram, sketch, table or chart precisely enough to reason about it later —
+   e.g. for a circuit: each component with its label/value (R1 = 4 kΩ, 12 V source…), how they are
+   connected (series/parallel, nodes), and any marked currents or voltages; for a graph: axes, units,
+   curve shape and marked points; for a table: its rows and columns.
+3. If the page is empty or only scribbles, say so in one line.
+
+Answer in plain text with the headings "Text:" and "Drawings:" (omit a heading when there is nothing for it)."""
+
+
+def read_drawing(image_path) -> str:
+    """
+    Transcribe / describe a hand-drawn page (sketch cards).
+    Order: the user's own Claude key, NEXO's Claude, then Gemini
+    (the user's own Gemini key when connected, otherwise NEXO's).
+    """
+    provider, user_key, user_model = user_keys.answer_settings()
+    content = [_claude_image_block(image_path), {"type": "text", "text": SKETCH_READ_PROMPT}]
+
+    if provider == "anthropic" and user_key:
+        try:
+            response = _claude_request(user_key, user_model or CLAUDE_STRONG_MODEL, content, SKETCH_READ_SYSTEM, 8192, timeout=150)
+        except requests.RequestException as error:
+            raise UserKeyError(f"Could not reach Anthropic: {error}") from error
+        if not response.ok:
+            _raise_user_provider_error("anthropic", response)
+        answer = _claude_text(response.json())
+        if answer:
+            return answer
+
+    if provider not in ("anthropic", "gemini"):
+        answer = _nexo_claude(content, SKETCH_READ_SYSTEM, 4096, heavy=True, timeout=150)
+        if answer:
+            return answer
+
+    return generate_image(SKETCH_READ_PROMPT, str(image_path), system_instruction=SKETCH_READ_SYSTEM, temperature=0.1, max_output_tokens=4096)

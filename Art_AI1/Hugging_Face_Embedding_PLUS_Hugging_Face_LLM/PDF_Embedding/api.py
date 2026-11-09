@@ -46,7 +46,7 @@ import ingest_progress
 import detective
 from image_tools import IMAGE_EXTENSIONS, crop_region, prepare_image
 import user_keys
-from gemini_client import UserKeyError
+from gemini_client import UserKeyError, read_drawing
 from rag_query import query_general, query_text_rag
 
 
@@ -615,6 +615,7 @@ async def detective_analyze(
         raise HTTPException(status_code=400, detail="user_id is required.")
 
     request_keys = user_keys.from_headers(request.headers)
+    request_keys["task_tier"] = "heavy"  # Photo Detective: NEXO uses its strong model
     selected = parse_source_filters(source_filters=source_filters, source_filter=None)
 
     try:
@@ -681,6 +682,37 @@ async def detective_analyze(
         "report": result["report"],
         "sources": sources,
     }
+
+
+@app.post(
+    "/describe/sketch",
+    dependencies=[Depends(require_api_key)],
+)
+async def describe_sketch(request: Request, image: UploadFile = File(...)):
+    """Transcribe the handwriting and describe the drawings on a sketch card (PNG/JPEG)."""
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The drawing is empty.")
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="The drawing is too large to read.")
+    suffix = ".png" if (image.content_type or "").endswith("png") else ".jpg"
+    request_keys = user_keys.from_headers(request.headers)
+
+    def run():
+        with tempfile.TemporaryDirectory(prefix="nexo_sketch_") as temp_dir:
+            path = Path(temp_dir) / f"sketch{suffix}"
+            path.write_bytes(data)
+            with user_keys.using(request_keys):
+                return read_drawing(path)
+
+    try:
+        text = await run_in_threadpool(run)
+    except UserKeyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        print(f"[SKETCH READ ERROR] {type(error).__name__}: {error}")
+        raise HTTPException(status_code=502, detail="The AI could not read the drawing right now. Please try again.")
+    return {"text": str(text or "").strip()[:20000]}
 
 
 @app.get(
