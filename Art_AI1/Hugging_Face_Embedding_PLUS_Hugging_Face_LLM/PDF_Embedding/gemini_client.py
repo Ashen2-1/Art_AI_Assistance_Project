@@ -107,6 +107,12 @@ def _raise_user_provider_error(provider: str, response: requests.Response) -> No
             f"Your {name} API key was rejected ({response.status_code}). "
             "Check it in Settings → AI keys, or switch back to the NEXO default."
         )
+    if response.status_code == 402:
+        raise UserKeyError(
+            f"Your {name} account has no prepaid credit left, so it cannot answer. "
+            "Add credit to that project's billing (Google AI Studio → Projects → Billing), "
+            "or open Settings → AI keys and remove your key to use the NEXO default for now."
+        )
     if response.status_code == 429:
         raise UserKeyError(
             f"Your {name} account hit its rate limit or has no credit left. "
