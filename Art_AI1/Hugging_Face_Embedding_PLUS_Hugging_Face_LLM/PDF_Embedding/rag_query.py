@@ -17,6 +17,14 @@ from prompt_profiles import build_system_prompt
 TOP_K = 3
 
 
+# How answers write maths (the app renders $...$ / $$...$$ with KaTeX).
+MATH_RULE = (
+    "Write mathematics in LaTeX: $...$ for inline maths and $$...$$ on its own line for "
+    "displayed equations (e.g. $\\frac{dN}{dt} = rN\\left(1 - \\frac{N}{K}\\right)$). "
+    "Never use \\( \\) or \\[ \\]. Keep citations like [S1] outside the maths. "
+    "Write money as USD 5, not with a dollar sign."
+)
+
 # This instruction is intentionally domain-neutral.
 # A project-specific domain will be added later.
 RESEARCH_SYSTEM_INSTRUCTION = """
@@ -38,7 +46,7 @@ When source context is supplied:
    "I cannot find this in the provided sources."
 5. Do not invent quotations, page numbers, citations, results,
    formulas, or evidence.
-6. Do not use LaTeX syntax. Write formulas in plain readable text unless the user specifically asks for mathematical notation.
+6. Write mathematics in LaTeX: $...$ for inline maths and $$...$$ on its own line for displayed equations (e.g. $\\frac{dN}{dt} = rN\\left(1 - \\frac{N}{K}\\right)$). Never use \\( \\) or \\[ \\]. Keep citations like [S1] outside the maths. Write money as USD 5, not with a dollar sign.
 
 Use clear Markdown with short paragraphs. Use bullet points when
 they make the response easier to understand.
@@ -54,6 +62,8 @@ science, technology, and other research fields.
 Adapt to the user's subject and level of knowledge. Explain ideas
 clearly, accurately, and concisely. Do not fabricate sources,
 results, formulas, quotations, or citations.
+
+Write mathematics in LaTeX: $...$ for inline maths and $$...$$ on its own line for displayed equations (e.g. $\\frac{dN}{dt} = rN\\left(1 - \\frac{N}{K}\\right)$). Never use \\( \\) or \\[ \\]. Keep citations like [S1] outside the maths. Write money as USD 5, not with a dollar sign.
 
 Use Markdown and short readable paragraphs.
 """.strip()
@@ -368,7 +378,7 @@ Requirements:
    limitation clearly.
 6. Use the conversation history only to understand follow-up
    questions. Do not treat conversation history as source evidence.
-7. Do not use LaTeX syntax. Write formulas in plain readable text unless the user specifically asks for mathematical notation.
+7. {MATH_RULE}
 8. When citing multiple sources, write them separately as [S1] [S2] [S3], not inside one combined bracket.
 """.strip()
 
@@ -376,7 +386,7 @@ Requirements:
         prompt=prompt,
         system_instruction=RESEARCH_SYSTEM_INSTRUCTION,
         temperature=0.15,
-        max_output_tokens=2048,
+        max_output_tokens=8192,
     )
 
     return {
@@ -417,7 +427,7 @@ Current user question:
         prompt=prompt,
         system_instruction=GENERAL_SYSTEM_INSTRUCTION,
         temperature=0.3,
-        max_output_tokens=2048,
+        max_output_tokens=8192,
     )
 
     return {
@@ -675,4 +685,4 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    print_result(result)
+    print_result(result)
