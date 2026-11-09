@@ -3,6 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+# Fewer glibc malloc arenas: keeps memory from creeping up on the 512 MB plan.
+ENV MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 
@@ -21,4 +23,4 @@ COPY . .
 
 EXPOSE 10000
 
-CMD sh -c "uvicorn api:app --host 0.0.0.0 --port ${PORT:-10000}"
+CMD sh -c "uvicorn api:app --host 0.0.0.0 --port ${PORT:-10000}"

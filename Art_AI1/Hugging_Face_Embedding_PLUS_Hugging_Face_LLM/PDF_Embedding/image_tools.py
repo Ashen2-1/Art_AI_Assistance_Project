@@ -50,6 +50,10 @@ def is_image(path: str) -> bool:
 def prepare_image(path: str, out_dir: str, max_side: int = MAX_SIDE) -> str:
     """Normalise to an RGB JPEG that the vision model accepts."""
     with Image.open(path) as image:
+        # JPEG: decode straight at a reduced size. A 48 MP phone photo is
+        # ~140 MB once decoded; draft() keeps it near the size we need.
+        if image.format == "JPEG":
+            image.draft("RGB", (max_side, max_side))
         image = ImageOps.exif_transpose(image)
         if getattr(image, "n_frames", 1) > 1:
             image.seek(0)
@@ -66,6 +70,12 @@ def crop_region(path: str, box: dict, out_dir: str, pad: float = 0.12) -> str:
     (0-1) of the image. A little padding keeps hair, collars and hands.
     """
     with Image.open(path) as image:
+        # Decode big JPEGs at a reduced scale (>= 2560 px: plenty for a face crop, a
+        # fraction of the memory), and apply the EXIF rotation so the box
+        # matches the picture the researcher saw in the browser.
+        if image.format == "JPEG":
+            image.draft("RGB", (2560, 2560))
+        image = ImageOps.exif_transpose(image)
         image = image.convert("RGB")
         width, height = image.size
         x = max(0.0, min(1.0, float(box.get("x", 0))))
