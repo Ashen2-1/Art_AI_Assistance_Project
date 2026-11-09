@@ -128,7 +128,36 @@ def _post_gemini(model: str, api_key: str, payload: dict, timeout: int) -> reque
         print(f"[Gemini] busy ({response.status_code}); retry {attempt}/{len(GEMINI_RETRY_DELAYS)} in {delay}s with {current!r}")
         time.sleep(delay)
         response = send(current)
+    _meter_gemini(response, current, api_key)
     return response
+
+
+def _meter_gemini(response, model, api_key):
+    """Count the tokens of a successful Gemini call for the usage dashboard."""
+    if not response.ok:
+        return
+    try:
+        meta = response.json().get("usageMetadata") or {}
+    except ValueError:
+        return
+    user_keys.record_usage(
+        "gemini",
+        model or GEMINI_MODEL,
+        meta.get("promptTokenCount", 0),
+        (meta.get("candidatesTokenCount") or 0) + (meta.get("thoughtsTokenCount") or 0),
+        "nexo" if api_key == GEMINI_API_KEY else "user",
+    )
+
+
+def _meter_openai_style(provider, model, data, payer="user"):
+    usage = data.get("usage") or {}
+    user_keys.record_usage(provider, data.get("model") or model, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), payer)
+
+
+def _meter_claude(model, data, payer):
+    usage = data.get("usage") or {}
+    prompt = (usage.get("input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0)
+    user_keys.record_usage("anthropic", data.get("model") or model, prompt, usage.get("output_tokens", 0), payer)
 
 
 def _post_gemini_patient(model: str, api_key: str, payload: dict, timeout: int, label: str = "request") -> requests.Response:
@@ -234,6 +263,7 @@ def _generate_openai(prompt, system_instruction, temperature, max_output_tokens,
         _raise_user_provider_error("openai", response)
 
     data = response.json()
+    _meter_openai_style("openai", payload["model"], data)
     choices = data.get("choices") or []
     answer = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
     if not answer:
@@ -292,6 +322,7 @@ def _generate_compatible(provider, base_url, prompt, system_instruction, tempera
         _raise_user_provider_error(provider, response)
 
     data = response.json()
+    _meter_openai_style(provider, model, data)
     choices = data.get("choices") or []
     answer = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
     # Reasoning models (e.g. Qwen3) may wrap their thinking in <think> tags.
@@ -301,7 +332,7 @@ def _generate_compatible(provider, base_url, prompt, system_instruction, tempera
     return answer
 
 
-def _claude_request(key, model, content, system_instruction, max_tokens, timeout=120, effort=None):
+def _claude_request(key, model, content, system_instruction, max_tokens, timeout=120, effort=None, payer="user"):
     """
     One Messages API call. Returns the requests.Response.
     No temperature/top_p: current Claude models reject them (HTTP 400) and
@@ -332,6 +363,11 @@ def _claude_request(key, model, content, system_instruction, max_tokens, timeout
             json=payload,
             timeout=timeout,
         )
+    if response.ok:
+        try:
+            _meter_claude(model, response.json(), payer)
+        except ValueError:
+            pass
     return response
 
 
@@ -370,7 +406,12 @@ def _generate_anthropic(prompt, system_instruction, temperature, max_output_toke
 
 
 def nexo_claude_enabled() -> bool:
-    return NEXO_ANSWER_PROVIDER == "claude" and bool(ANTHROPIC_API_KEY) and time.time() >= _claude_paused_until
+    return (
+        NEXO_ANSWER_PROVIDER == "claude"
+        and bool(ANTHROPIC_API_KEY)
+        and time.time() >= _claude_paused_until
+        and user_keys.claude_allowed()  # off when the monthly budget is used up
+    )
 
 
 def _nexo_claude(content, system_instruction, max_output_tokens, heavy=False, timeout=None):
@@ -392,6 +433,7 @@ def _nexo_claude(content, system_instruction, max_output_tokens, heavy=False, ti
             timeout=timeout or (150 if heavy else 90),
             # Sonnet thinks hard by default; medium keeps Photo Detective quick.
             effort="medium" if heavy else None,
+            payer="nexo",
         )
     except requests.RequestException as error:
         print(f"[Claude] {model} unavailable ({type(error).__name__}); using Gemini")

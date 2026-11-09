@@ -65,6 +65,10 @@ def from_headers(headers) -> dict:
         "answer_endpoint": _clean(headers.get("x-answer-endpoint"), 80),
         # "heavy" = AI reports, Photo Detective: NEXO uses its strong model.
         "task_tier": "heavy" if _clean(headers.get("x-task-tier"), 10).lower() == "heavy" else "",
+        # Express sends "off" when NEXO's monthly Claude budget is used up.
+        "claude_off": _clean(headers.get("x-nexo-claude"), 10).lower() == "off",
+        # Every AI call made for this request (tokens, model, who pays): sent back to Express.
+        "usage": [],
     }
 
 
@@ -99,6 +103,37 @@ def answer_settings():
     if provider in KEYED_PROVIDERS:
         return provider, keys.get("answer_key", ""), keys.get("answer_model", "")
     return "nexo", "", ""
+
+
+def claude_allowed() -> bool:
+    return not _get().get("claude_off")
+
+
+def record_usage(provider: str, model: str, input_tokens, output_tokens, payer: str, kind: str = "chat") -> None:
+    """Remember one AI call for the usage dashboard (no-op outside a request)."""
+    keys = _current.get()
+    if keys is None:
+        return
+    try:
+        entry = {
+            "provider": provider,
+            "model": str(model or "")[:80],
+            "input": max(0, int(input_tokens or 0)),
+            "output": max(0, int(output_tokens or 0)),
+            "payer": "nexo" if payer == "nexo" else "user",
+            "kind": kind,
+        }
+    except (TypeError, ValueError):
+        return
+    usage = keys.setdefault("usage", [])
+    # Embedding batches: merge into one line per model.
+    if kind == "embed":
+        for item in usage:
+            if item["kind"] == "embed" and item["model"] == entry["model"] and item["payer"] == entry["payer"]:
+                item["input"] += entry["input"]
+                return
+    if len(usage) < 200:
+        usage.append(entry)
 
 
 def heavy_task() -> bool:
