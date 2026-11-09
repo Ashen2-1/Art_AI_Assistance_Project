@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 import base64
+import io
 import mimetypes
 
 import re
@@ -21,6 +22,14 @@ GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite",
 ).strip()
+
+# Photo work (Photo Detective, image cards) needs more than the lite model.
+# A model name that does not exist falls back to GEMINI_MODEL (404 handling).
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-flash-latest").strip() or GEMINI_MODEL
+
+# Images are shrunk before upload: big scans are slow to send and to read,
+# and 1600 px is plenty to compare faces, clothes and studio backdrops.
+IMAGE_MAX_SIDE = int(os.getenv("GEMINI_IMAGE_MAX_SIDE", "1600"))
 
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/"
@@ -107,6 +116,52 @@ def _post_gemini(model: str, api_key: str, payload: dict, timeout: int) -> reque
         time.sleep(delay)
         response = send(current)
     return response
+
+
+def _post_gemini_patient(model: str, api_key: str, payload: dict, timeout: int, label: str = "request") -> requests.Response:
+    """
+    _post_gemini, but a model that is too slow (e.g. a Pro model thinking
+    through several photos) gets one more try on the fast default model
+    instead of failing with a timeout.
+    """
+    try:
+        return _post_gemini(model, api_key, payload, timeout)
+    except requests.Timeout as error:
+        slow = model or GEMINI_MODEL
+        if slow != GEMINI_MODEL:
+            print(f"[Gemini] {label} on {slow!r} timed out after {timeout}s; retrying with {GEMINI_MODEL!r}")
+            try:
+                return _post_gemini(GEMINI_MODEL, api_key, payload, max(60, timeout - 60))
+            except requests.Timeout:
+                pass
+        raise GeminiAPIError(
+            f"Gemini took too long to answer ({slow}). Please try again"
+            + (" — or choose a Flash model in Settings → AI keys, which is much faster with photos." if "pro" in slow.lower() else ".")
+        ) from error
+
+
+def _image_part(image_path) -> dict:
+    """Inline image for Gemini, shrunk to IMAGE_MAX_SIDE and re-encoded as JPEG."""
+    image_file = Path(image_path)
+    raw = image_file.read_bytes()
+    mime_type, _ = mimetypes.guess_type(image_file.name)
+    if not mime_type or not mime_type.startswith("image/"):
+        mime_type = "image/jpeg"
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(raw)) as picture:
+            picture = ImageOps.exif_transpose(picture)
+            if max(picture.size) > IMAGE_MAX_SIDE or len(raw) > 1_500_000 or mime_type not in ("image/jpeg", "image/png", "image/webp"):
+                picture = picture.convert("RGB")
+                picture.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+                buffer = io.BytesIO()
+                picture.save(buffer, format="JPEG", quality=86, optimize=True)
+                raw = buffer.getvalue()
+                mime_type = "image/jpeg"
+    except Exception as error:  # unreadable by Pillow: send the original
+        print(f"[Gemini] could not shrink {image_file.name}: {error}")
+    return {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(raw).decode("utf-8")}}
 
 
 def _raise_user_provider_error(provider: str, response: requests.Response) -> None:
@@ -399,11 +454,8 @@ def generate_text(
         }
 
     try:
-        response = _post_gemini(gemini_model, api_key, payload, 90)
-    except requests.Timeout as error:
-        raise GeminiAPIError(
-            "Gemini request timed out. Please try again."
-        ) from error
+        # Long answers (reports, Photo Detective reasoning) need more time.
+        response = _post_gemini_patient(gemini_model, api_key, payload, 90 if max_output_tokens <= 2048 else 150, "answer")
     except requests.RequestException as error:
         raise GeminiAPIError(
             "Could not connect to the Gemini API."
@@ -447,32 +499,8 @@ def generate_image(
             f"Image was not found: {image_path}"
         )
 
-    mime_type, _ = mimetypes.guess_type(image_file.name)
-
-    if not mime_type or not mime_type.startswith("image/"):
-        mime_type = "image/jpeg"
-
-    encoded_image = base64.b64encode(
-        image_file.read_bytes()
-    ).decode("utf-8")
-
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "inlineData": {
-                            "mimeType": mime_type,
-                            "data": encoded_image,
-                        }
-                    },
-                    {
-                        "text": prompt.strip(),
-                    },
-                ],
-            }
-        ],
+        "contents": [{"role": "user", "parts": [_image_part(image_file), {"text": prompt.strip()}]}],
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_output_tokens,
@@ -480,28 +508,10 @@ def generate_image(
     }
 
     if system_instruction:
-        payload["systemInstruction"] = {
-            "parts": [
-                {
-                    "text": system_instruction.strip(),
-                }
-            ]
-        }
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction.strip()}]}
 
     try:
-        response = requests.post(
-            GEMINI_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": image_key,
-            },
-            json=payload,
-            timeout=120,
-        )
-    except requests.Timeout as error:
-        raise GeminiAPIError(
-            "Gemini image request timed out."
-        ) from error
+        response = _post_gemini_patient(GEMINI_VISION_MODEL, image_key, payload, 120, "image description")
     except requests.RequestException as error:
         raise GeminiAPIError(
             "Could not connect to the Gemini API."
@@ -534,24 +544,13 @@ def generate_multimodal(
 
     provider, user_key, user_model = user_keys.answer_settings()
     api_key = user_keys.gemini_key(GEMINI_API_KEY)
-    model = user_model if provider == "gemini" and user_model else GEMINI_MODEL
+    model = user_model if provider == "gemini" and user_model else GEMINI_VISION_MODEL
     own_key = user_keys.using_own_gemini_key()
 
     if not api_key:
         raise GeminiAPIError(f"GEMINI_API_KEY was not found in {ENV_PATH}")
 
-    parts = []
-    for image_path in image_paths:
-        image_file = Path(image_path)
-        mime_type, _ = mimetypes.guess_type(image_file.name)
-        if not mime_type or not mime_type.startswith("image/"):
-            mime_type = "image/jpeg"
-        parts.append({
-            "inlineData": {
-                "mimeType": mime_type,
-                "data": base64.b64encode(image_file.read_bytes()).decode("utf-8"),
-            }
-        })
+    parts = [_image_part(image_path) for image_path in image_paths]
     parts.append({"text": prompt.strip()})
 
     generation_config = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
@@ -563,9 +562,7 @@ def generate_multimodal(
         payload["systemInstruction"] = {"parts": [{"text": system_instruction.strip()}]}
 
     try:
-        response = _post_gemini(model, api_key, payload, 150)
-    except requests.Timeout as error:
-        raise GeminiAPIError("Gemini request timed out. Please try again.") from error
+        response = _post_gemini_patient(model, api_key, payload, 150, "image request")
     except requests.RequestException as error:
         raise GeminiAPIError("Could not connect to the Gemini API.") from error
 
