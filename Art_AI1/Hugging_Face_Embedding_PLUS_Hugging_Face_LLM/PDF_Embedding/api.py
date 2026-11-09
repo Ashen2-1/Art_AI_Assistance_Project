@@ -303,6 +303,7 @@ async def query_general_endpoint(
         "question": question,
         "answer": result["answer"],
         "sources": [],
+        "usage": request_keys.get("usage", []),
     }
 
 
@@ -417,6 +418,7 @@ async def query_text_endpoint(
             "No answer was returned.",
         ),
         "sources": sources,
+        "usage": request_keys.get("usage", []),
     }
 
 OWN_GEMINI_KEY_REJECTED = (
@@ -533,6 +535,7 @@ async def ingest_document(
             "chunks_added": chunks_added,
             "db_total": stats["total_chunks"],
             "sources": stats["sources"],
+            "usage": request_keys.get("usage", []),
         }
 
     except HTTPException:
@@ -681,6 +684,7 @@ async def detective_analyze(
         "observations": result["observations"],
         "report": result["report"],
         "sources": sources,
+        "usage": request_keys.get("usage", []),
     }
 
 
@@ -712,7 +716,7 @@ async def describe_sketch(request: Request, image: UploadFile = File(...)):
     except Exception as error:
         print(f"[SKETCH READ ERROR] {type(error).__name__}: {error}")
         raise HTTPException(status_code=502, detail="The AI could not read the drawing right now. Please try again.")
-    return {"text": str(text or "").strip()[:20000]}
+    return {"text": str(text or "").strip()[:20000], "usage": request_keys.get("usage", [])}
 
 
 @app.get(

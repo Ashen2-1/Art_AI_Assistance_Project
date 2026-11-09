@@ -339,6 +339,13 @@ def _post_with_retries(
             continue
 
         if response.ok:
+            # Embeddings report no token count: estimate ~4 characters per token.
+            try:
+                texts = [part.get("text", "") for request in payload.get("requests", [payload]) for part in (request.get("content") or {}).get("parts", [])]
+                key = user_keys.gemini_key(GEMINI_API_KEY)
+                user_keys.record_usage("gemini", url.split("/models/")[-1].split(":")[0], sum(len(text) for text in texts) // 4, 0, "nexo" if key == GEMINI_API_KEY else "user", kind="embed")
+            except Exception:  # metering never breaks indexing
+                pass
             return response.json()
 
         message = _read_error_message(response)
