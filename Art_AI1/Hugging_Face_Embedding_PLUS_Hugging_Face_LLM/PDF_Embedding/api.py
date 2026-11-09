@@ -21,6 +21,7 @@ from fastapi import (
     Security,
     UploadFile,
 )
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from starlette.concurrency import run_in_threadpool
 import uvicorn
@@ -218,16 +219,22 @@ app = FastAPI(
     version="1.2.0",
     lifespan=lifespan,
 )
+QUIET_PATHS = ("/health", "/ingest/progress/")  # frequent polls: keep the logs readable
+
+
 @app.middleware("http")
 async def log_requests(request, call_next):
-    print(f"[REQUEST START] {request.method} {request.url.path}")
+    quiet = request.url.path.startswith(QUIET_PATHS)
+    if not quiet:
+        print(f"[REQUEST START] {request.method} {request.url.path}")
 
     try:
         response = await call_next(request)
-        print(
-            f"[REQUEST DONE] {request.method} {request.url.path} "
-            f"status={response.status_code}"
-        )
+        if not quiet or response.status_code >= 400:
+            print(
+                f"[REQUEST DONE] {request.method} {request.url.path} "
+                f"status={response.status_code}"
+            )
         return response
 
     except Exception as error:
@@ -239,10 +246,13 @@ async def log_requests(request, call_next):
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "service": "nexo-rag-api",
-    }
+    # The NEXO web app wakes this service from the user's browser (its own IP
+    # is not rate limited by Cloudflare like our server's shared IP), so this
+    # one public, data-free endpoint may be read cross-origin.
+    return JSONResponse(
+        {"status": "ok", "service": "nexo-rag-api"},
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"},
+    )
 
 
 @app.post(
