@@ -21,7 +21,7 @@ from typing import List
 import numpy as np
 import pdfplumber
 import pytesseract
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image, ImageEnhance, ImageFilter
 from pypdf import PdfReader
 
@@ -44,7 +44,12 @@ else:
 MIN_CHARS_PER_PAGE    = 100   # avg chars/page below this → treat as scanned
 DEFAULT_CHUNK_SIZE    = 1000
 DEFAULT_CHUNK_OVERLAP = 200
-OCR_DPI               = 400   # higher DPI = more detail for Tesseract
+# Higher DPI = more detail for Tesseract. Converting a whole scanned book
+# at 400 DPI colour at once (~45 MB per page) ran the 512 MB server out of
+# memory ("exceeded its memory limit"). Pages are now rendered one at a
+# time in grayscale (~15 MB each), so 400 DPI is affordable.
+OCR_DPI               = int(os.getenv("OCR_DPI", "400"))
+MAX_OCR_PIXELS        = 30_000_000  # very large pages (posters, maps) are scaled down
 
 
 
@@ -311,6 +316,38 @@ def _segment_lines(page_image: Image.Image, min_line_height: int = 12) -> List[I
 # D. OCR ENGINES
 # =============================================================
 
+def _pdf_page_count(pdf_path: str) -> int:
+    try:
+        return int(pdfinfo_from_path(pdf_path).get("Pages") or 0)
+    except Exception:
+        try:
+            return len(PdfReader(pdf_path).pages)
+        except Exception:
+            return 0
+
+
+def _iter_pdf_pages(pdf_path: str, dpi: int, grayscale: bool = True):
+    """
+    Yield (index, total, PIL image) one page at a time, so only one
+    rendered page is in memory instead of the whole document.
+    """
+    total = _pdf_page_count(pdf_path)
+    if total <= 0:
+        raise RuntimeError("Could not read the number of pages in this PDF.")
+
+    for number in range(1, total + 1):
+        pages = convert_from_path(pdf_path, dpi=dpi, first_page=number, last_page=number, grayscale=grayscale)
+        if not pages:
+            continue
+        image = pages[0]
+        del pages
+        if image.width * image.height > MAX_OCR_PIXELS:
+            factor = (MAX_OCR_PIXELS / (image.width * image.height)) ** 0.5
+            image = image.resize((max(1, int(image.width * factor)), max(1, int(image.height * factor))))
+        yield number - 1, total, image
+        image.close()
+
+
 def _extract_ocr_printed(pdf_path: str) -> str:
     """
     PRINTED / SCANNED PDF OCR
@@ -328,15 +365,14 @@ def _extract_ocr_printed(pdf_path: str) -> str:
       --oem 3   : use both legacy + LSTM engines (best accuracy)
       --psm 6   : assume a uniform block of text per page
     """
-    print("[PDF Pipeline] Converting pages to images (400 DPI) ...")
-    images      = convert_from_path(pdf_path, dpi=OCR_DPI)
+    print(f"[PDF Pipeline] Rendering pages one at a time ({OCR_DPI} DPI, grayscale) ...")
     tess_config = r"--oem 3 --psm 6"
     full_text   = ""
     page_num    = 1
 
-    for i, image in enumerate(images):
-        print(f"[PDF Pipeline]   Scan {i + 1}/{len(images)} ...")
-        report_progress("ocr", i, len(images))
+    for i, total, image in _iter_pdf_pages(pdf_path, OCR_DPI):
+        print(f"[PDF Pipeline]   Scan {i + 1}/{total} ...")
+        report_progress("ocr", i, total)
 
         # Split open-book spreads into individual pages
         sub_pages = _split_two_page_scan(image)
@@ -381,12 +417,11 @@ def _extract_ocr_cursive(pdf_path: str) -> str:
     model.eval()
     print("[PDF Pipeline] TrOCR model ready.")
 
-    images    = convert_from_path(pdf_path, dpi=300)
     full_text = ""
 
-    for i, page_img in enumerate(images):
-        print(f"[PDF Pipeline]   Cursive OCR page {i + 1}/{len(images)} ...")
-        report_progress("ocr", i, len(images))
+    for i, total, page_img in _iter_pdf_pages(pdf_path, 300):
+        print(f"[PDF Pipeline]   Cursive OCR page {i + 1}/{total} ...")
+        report_progress("ocr", i, total)
         lines     = _segment_lines(page_img)
         page_text = ""
 
