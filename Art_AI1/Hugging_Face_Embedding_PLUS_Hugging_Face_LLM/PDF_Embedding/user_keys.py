@@ -63,6 +63,8 @@ def from_headers(headers) -> dict:
         "answer_key": _clean(headers.get("x-answer-key")),
         "answer_model": _clean(headers.get("x-answer-model"), 120),
         "answer_endpoint": _clean(headers.get("x-answer-endpoint"), 80),
+        # "heavy" = AI reports, Photo Detective: NEXO uses its strong model.
+        "task_tier": "heavy" if _clean(headers.get("x-task-tier"), 10).lower() == "heavy" else "",
     }
 
 
@@ -97,6 +99,10 @@ def answer_settings():
     if provider in KEYED_PROVIDERS:
         return provider, keys.get("answer_key", ""), keys.get("answer_model", "")
     return "nexo", "", ""
+
+
+def heavy_task() -> bool:
+    return _get().get("task_tier") == "heavy"
 
 
 def answer_endpoint() -> str:
