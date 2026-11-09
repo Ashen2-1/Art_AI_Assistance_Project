@@ -268,15 +268,23 @@ async def query_general_endpoint(
     task: str = Form("answer"),
 ):
     history = parse_chat_history(chat_history)
+    request_keys = user_keys.from_headers(request.headers)
 
-    try:
-        with user_keys.using(user_keys.from_headers(request.headers)):
-            result = query_general(
+    # The AI call is slow, blocking network I/O. Run it in a worker thread:
+    # inside this async handler it froze the whole server, Render's health
+    # checks stopped getting answers, and after ~60 s Render restarted the
+    # instance mid-answer ("AI service returned status 503").
+    def run():
+        with user_keys.using(request_keys):
+            return query_general(
                 question,
                 chat_history=history,
                 domain=domain,
                 task=task,
             )
+
+    try:
+        result = await run_in_threadpool(run)
     except UserKeyError as error:
         raise HTTPException(status_code=400, detail=str(error))
     except Exception as error:
@@ -339,9 +347,10 @@ async def query_text_endpoint(
 
     request_keys = user_keys.from_headers(request.headers)
 
-    try:
+    # Worker thread: embedding + search + AI answer are blocking calls (see /query/general).
+    def run():
         with user_keys.using(request_keys):
-            result = query_text_rag(
+            return query_text_rag(
                 question=safe_question,
                 user_id=safe_user_id,
                 canvas_id=safe_canvas_id,
@@ -350,6 +359,9 @@ async def query_text_endpoint(
                 chat_history=history,
                 inline_context=inline_context,
             )
+
+    try:
+        result = await run_in_threadpool(run)
 
     except UserKeyError as error:
         raise HTTPException(status_code=400, detail=str(error))
@@ -707,7 +719,8 @@ async def source_chunks(
     if not safe_user_id or not source.strip():
         raise HTTPException(status_code=400, detail="user_id and source are required.")
 
-    rows = get_source_chunks(
+    rows = await run_in_threadpool(
+        get_source_chunks,
         user_id=safe_user_id,
         canvas_id=canvas_id.strip() or "default",
         source=source,
@@ -735,7 +748,8 @@ async def get_sources(
     canvas_id: str = "default",
 ):
     return {
-        "sources": list_sources(
+        "sources": await run_in_threadpool(
+            list_sources,
             user_id=user_id,
             canvas_id=canvas_id,
         ),
@@ -750,7 +764,8 @@ async def database_stats(
     user_id: str,
     canvas_id: str = "default",
 ):
-    stats = get_stats(
+    stats = await run_in_threadpool(
+        get_stats,
         user_id=user_id,
         canvas_id=canvas_id,
     )
@@ -772,7 +787,8 @@ async def delete_source(
     user_id: str,
     canvas_id: str = "default",
 ):
-    deleted = db_delete_source(
+    deleted = await run_in_threadpool(
+        db_delete_source,
         source_name=source_name,
         user_id=user_id,
         canvas_id=canvas_id,
