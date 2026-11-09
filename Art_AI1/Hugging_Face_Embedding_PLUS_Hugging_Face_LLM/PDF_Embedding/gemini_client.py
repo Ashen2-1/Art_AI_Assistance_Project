@@ -4,6 +4,7 @@ from typing import Optional
 import base64
 import mimetypes
 
+import re
 import time
 import requests
 from dotenv import load_dotenv
@@ -35,7 +36,16 @@ class UserKeyError(GeminiAPIError):
     """The user's own API key was rejected or their provider failed."""
 
 
-PROVIDER_NAMES = {"gemini": "Gemini", "openai": "OpenAI", "anthropic": "Claude (Anthropic)"}
+PROVIDER_NAMES = {
+    "gemini": "Gemini",
+    "openai": "OpenAI",
+    "anthropic": "Claude (Anthropic)",
+    "groq": "Groq (Llama)",
+    "qwen": "Qwen (Alibaba Cloud)",
+}
+
+# Free / low-cost providers with an OpenAI-compatible chat API.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
 def _gemini_url(model: str = "") -> str:
@@ -110,8 +120,8 @@ def _raise_user_provider_error(provider: str, response: requests.Response) -> No
     if response.status_code == 402:
         raise UserKeyError(
             f"Your {name} account has no prepaid credit left, so it cannot answer. "
-            "Add credit to that project's billing (Google AI Studio → Projects → Billing), "
-            "or open Settings → AI keys and remove your key to use the NEXO default for now."
+            + ("Add credit to that project's billing (Google AI Studio → Projects → Billing), " if provider == "gemini" else "Add credit with that provider, ")
+            + "or open Settings → AI keys and remove your key to use the NEXO default for now."
         )
     if response.status_code == 429:
         raise UserKeyError(
@@ -160,6 +170,66 @@ def _generate_openai(prompt, system_instruction, temperature, max_output_tokens,
     answer = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
     if not answer:
         raise UserKeyError("OpenAI returned an empty answer.")
+    return answer
+
+
+def _generate_compatible(provider, base_url, prompt, system_instruction, temperature, max_output_tokens, key, model):
+    """Groq (Llama), Qwen and other OpenAI-compatible chat APIs."""
+    name = PROVIDER_NAMES.get(provider, provider)
+    messages = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction.strip()})
+    messages.append({"role": "user", "content": prompt.strip()})
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max(max_output_tokens, 1024),
+        "temperature": temperature,
+    }
+
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=120,
+            )
+        except requests.RequestException as error:
+            raise UserKeyError(f"Could not reach {name}: {error}") from error
+
+        # Free tiers limit tokens per minute: wait briefly once or twice.
+        if response.status_code == 429 and attempt < 2 and "day" not in (response.text or "").lower():
+            retry_after = response.headers.get("retry-after") or ""
+            try:
+                delay = min(20.0, max(1.0, float(retry_after)))
+            except ValueError:
+                delay = 6.0 * (attempt + 1)
+            print(f"[{name}] rate limited; retrying in {delay:.0f}s")
+            time.sleep(delay)
+            continue
+        # A request bigger than the model allows: ask for a shorter answer once.
+        if response.status_code in (400, 413) and attempt == 0 and "token" in (response.text or "").lower():
+            payload["max_tokens"] = 1024
+            continue
+        break
+
+    if not response.ok:
+        if response.status_code == 413 or (response.status_code == 400 and "context" in (response.text or "").lower()):
+            raise UserKeyError(
+                f"The question with its sources is too long for this {name} model. "
+                "Select fewer cards, or choose a model with a larger context in Settings → AI keys."
+            )
+        _raise_user_provider_error(provider, response)
+
+    data = response.json()
+    choices = data.get("choices") or []
+    answer = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+    # Reasoning models (e.g. Qwen3) may wrap their thinking in <think> tags.
+    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
+    if not answer:
+        raise UserKeyError(f"{name} returned an empty answer.")
     return answer
 
 
@@ -280,6 +350,18 @@ def generate_text(
 
     if provider == "anthropic" and user_key:
         return _generate_anthropic(prompt, system_instruction, temperature, max_output_tokens, user_key, user_model)
+
+    if provider == "groq" and user_key:
+        return _generate_compatible(
+            "groq", GROQ_BASE_URL, prompt, system_instruction, temperature, max_output_tokens, user_key,
+            user_model or os.getenv("GROQ_DEFAULT_MODEL", "llama-3.3-70b-versatile"),
+        )
+
+    if provider == "qwen" and user_key:
+        return _generate_compatible(
+            "qwen", user_keys.qwen_base_url(user_keys.answer_endpoint()), prompt, system_instruction, temperature,
+            max_output_tokens, user_key, user_model or os.getenv("QWEN_DEFAULT_MODEL", "qwen-plus"),
+        )
 
     own_gemini = provider == "gemini" and bool(user_key)
     api_key = user_key if own_gemini else GEMINI_API_KEY

@@ -5,9 +5,12 @@ Express (the only caller; protected by the internal API key) may send:
 
     X-User-Gemini-Key   the user's Gemini key: used for embeddings
                         (indexing + search) and for Gemini answers
-    X-Answer-Provider   nexo | gemini | openai | anthropic
-    X-Answer-Key        key for the answer provider (openai / anthropic)
+    X-Answer-Provider   nexo | gemini | openai | anthropic | groq | qwen
+    X-Answer-Key        key for the answer provider (all but gemini)
     X-Answer-Model      model id chosen by the user (optional)
+    X-Answer-Endpoint   qwen only: region code, e.g. "intl", "us", "cn"
+                        or "intl:<workspace id>" (never a URL; see
+                        qwen_base_url, so a user cannot point us anywhere)
 
 Without headers everything uses NEXO's own GEMINI_API_KEY, as before.
 Embeddings always use the same Gemini embedding model, so vectors made
@@ -20,7 +23,27 @@ that runs in a worker thread must enter `using(...)` inside that thread.
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-PROVIDERS = {"nexo", "gemini", "openai", "anthropic"}
+import re
+
+PROVIDERS = {"nexo", "gemini", "openai", "anthropic", "groq", "qwen"}
+KEYED_PROVIDERS = ("openai", "anthropic", "groq", "qwen")
+
+# Alibaba Cloud Model Studio (Qwen), OpenAI-compatible mode. Keys are bound
+# to the region they were created in.
+_QWEN_HOSTS = {"intl": "dashscope-intl.aliyuncs.com", "us": "dashscope-us.aliyuncs.com", "cn": "dashscope.aliyuncs.com"}
+_QWEN_WORKSPACE_REGIONS = {"intl": "ap-southeast-1", "cn": "cn-beijing"}
+_ENDPOINT_PATTERN = re.compile(r"^(intl|us|cn)(?::([a-z0-9][a-z0-9-]{2,62}))?$")
+
+
+def qwen_base_url(code: str) -> str:
+    """Region code → base URL. Unknown codes fall back to the international endpoint."""
+    match = _ENDPOINT_PATTERN.match(str(code or "").strip().lower())
+    if not match:
+        return f"https://{_QWEN_HOSTS['intl']}/compatible-mode/v1"
+    region, workspace = match.group(1), match.group(2)
+    if workspace and region in _QWEN_WORKSPACE_REGIONS:
+        return f"https://{workspace}.{_QWEN_WORKSPACE_REGIONS[region]}.maas.aliyuncs.com/compatible-mode/v1"
+    return f"https://{_QWEN_HOSTS[region]}/compatible-mode/v1"
 
 _current: ContextVar = ContextVar("nexo_user_keys", default=None)
 
@@ -39,6 +62,7 @@ def from_headers(headers) -> dict:
         "answer_provider": provider,
         "answer_key": _clean(headers.get("x-answer-key")),
         "answer_model": _clean(headers.get("x-answer-model"), 120),
+        "answer_endpoint": _clean(headers.get("x-answer-endpoint"), 80),
     }
 
 
@@ -70,6 +94,11 @@ def answer_settings():
     provider = keys.get("answer_provider") or "nexo"
     if provider == "gemini":
         return provider, keys.get("gemini_key", ""), keys.get("answer_model", "")
-    if provider in ("openai", "anthropic"):
+    if provider in KEYED_PROVIDERS:
         return provider, keys.get("answer_key", ""), keys.get("answer_model", "")
     return "nexo", "", ""
+
+
+def answer_endpoint() -> str:
+    """Region code for providers that have one (Qwen)."""
+    return _get().get("answer_endpoint", "")
