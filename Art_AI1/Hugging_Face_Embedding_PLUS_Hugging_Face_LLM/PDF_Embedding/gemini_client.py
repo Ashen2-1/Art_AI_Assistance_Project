@@ -56,7 +56,10 @@ def _post_gemini(model: str, api_key: str, payload: dict, timeout: int) -> reque
       wait and retry a few times, switching to NEXO's default model for
       the later tries when another model was chosen;
     - retired model (404, e.g. an old model picked in Settings -> AI keys):
-      retry with NEXO's default model.
+      retry with NEXO's default model;
+    - daily quota of the chosen model used up (429 "quota exceeded", e.g. a
+      free-tier key allows only ~20 requests a day on a big model): try the
+      default lite model once, which has its own, larger quota.
     """
     models = [model or GEMINI_MODEL]
     if models[0] != GEMINI_MODEL:
@@ -82,6 +85,11 @@ def _post_gemini(model: str, api_key: str, payload: dict, timeout: int) -> reque
             break
         # 429 from a quota that is used up will not clear in seconds.
         if response.status_code == 429 and "quota" in (response.text or "").lower() and "exceeded" in (response.text or "").lower():
+            if current != GEMINI_MODEL:
+                print(f"[Gemini] quota for {current!r} used up; trying {GEMINI_MODEL!r}")
+                current = GEMINI_MODEL
+                response = send(current)
+                continue
             break
         if attempt >= 2 and current != GEMINI_MODEL:
             current = GEMINI_MODEL
