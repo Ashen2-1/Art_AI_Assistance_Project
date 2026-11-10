@@ -1,3 +1,4 @@
+import re
 from typing import Iterable, Optional
 
 
@@ -67,10 +68,29 @@ primary versus secondary evidence, scholarly position, and counterarguments.
 Distinguish the source author's position from the assistant's interpretation.
 """,
 
+    "medicine": """
+Separate study design, population, intervention, outcomes and effect size.
+Note evidence level (trial, cohort, case report, review) and limitations.
+Do not give personal medical advice; describe what the sources report.
+""",
+
+    "business": """
+Use clear definitions of metrics, time periods, currency and assumptions.
+Separate reported figures from estimates and opinions.
+Discuss trade-offs, risks and alternative explanations for trends.
+""",
+
+    "law": """
+Quote or cite the exact clause, section or case the claim rests on.
+Note the jurisdiction and date; law differs by place and changes over time.
+Distinguish what a text says from how it might be interpreted. This is not legal advice.
+""",
+
     "computer_science": """
 Prioritize system boundaries, data flow, algorithms, complexity,
 security, failure modes, reproducibility, evaluation, and implementation trade-offs.
 Clearly distinguish existing behavior from proposed architecture.
+Put code in fenced code blocks with the language name.
 """,
 }
 
@@ -122,30 +142,62 @@ contradictions, methodological limitations, and useful next research steps.
 }
 
 
+# Words that suggest a subject. Matched as whole words / phrases (so "art" does
+# not match "start", "chart" or "part"). Source file names count too.
 DOMAIN_KEYWORDS = {
     "art_history": {
-        "art", "artist", "painting", "photography", "museum",
-        "visual culture", "iconography", "art history",
+        "art", "artist", "artwork", "painting", "sculpture", "museum", "gallery",
+        "visual culture", "iconography", "art history", "curator", "exhibition",
+        "photograph", "photography", "daguerreotype", "albumen", "provenance",
     },
     "engineering": {
-        "engineering", "lidar", "imu", "robot", "hardware",
-        "sensor", "motor", "pcb", "prototype",
+        "engineering", "ece", "circuit", "voltage", "current", "resistor", "capacitor",
+        "transistor", "mosfet", "op amp", "microcontroller", "mcu", "arduino", "fpga",
+        "embedded", "pcb", "sensor", "actuator", "motor", "pump", "gearbox", "torque",
+        "rpm", "pwm", "adc", "uart", "spi", "i2c", "datasheet", "lidar", "imu", "robot",
+        "control system", "pid", "transfer function", "signal", "power supply",
+        "prototype", "cad", "stress", "strain", "beam", "load", "thermodynamics",
+        "fluid", "requirements", "tolerance", "hardware",
     },
     "mathematics": {
-        "mathematics", "math", "theorem", "proof",
-        "equation", "algebra", "calculus",
+        "mathematics", "math", "maths", "theorem", "lemma", "proof", "prove",
+        "corollary", "equation", "algebra", "linear algebra", "calculus", "integral",
+        "derivative", "differential equation", "matrix", "eigenvalue", "vector space",
+        "probability", "statistics", "topology", "series", "limit", "polynomial",
+        "geometry", "combinatorics",
     },
     "science": {
-        "experiment", "hypothesis", "biology", "chemistry",
-        "physics", "scientific", "sample",
+        "experiment", "hypothesis", "biology", "chemistry", "physics", "scientific",
+        "sample", "lab report", "titration", "reaction", "molecule", "cell", "gene",
+        "protein", "enzyme", "ecology", "quantum", "particle", "measurement",
+        "uncertainty", "control group", "specimen",
+    },
+    "medicine": {
+        "medicine", "medical", "clinical", "patient", "diagnosis", "treatment",
+        "trial", "randomized", "cohort", "epidemiology", "nursing", "pharmacology",
+        "dose", "symptom", "anatomy", "physiology",
     },
     "computer_science": {
-        "software", "algorithm", "database", "api",
-        "machine learning", "computer science", "code",
+        "software", "algorithm", "data structure", "database", "sql", "api",
+        "machine learning", "deep learning", "neural network", "computer science",
+        "code", "coding", "python", "javascript", "java", "c++", "react", "backend",
+        "frontend", "complexity", "big o", "compiler", "operating system", "git",
+        "server", "programming", "function", "class",
+    },
+    "business": {
+        "business", "economics", "finance", "accounting", "marketing", "revenue",
+        "profit", "market", "startup", "strategy", "management", "investment",
+        "pricing", "supply chain", "gdp", "inflation",
+    },
+    "law": {
+        "law", "legal", "contract", "clause", "statute", "court", "case law",
+        "regulation", "liability", "plaintiff", "defendant", "jurisdiction",
+        "compliance", "gdpr", "act",
     },
     "humanities": {
-        "history", "literature", "philosophy", "culture",
-        "humanities", "archive",
+        "history", "historical", "literature", "philosophy", "culture", "humanities",
+        "archive", "novel", "poem", "religion", "anthropology", "sociology",
+        "linguistics", "essay",
     },
 }
 
@@ -159,6 +211,10 @@ def normalize_domain(domain: Optional[str]) -> str:
         "engineering_research": "engineering",
         "math": "mathematics",
         "cs": "computer_science",
+        "eng": "engineering",
+        "med": "medicine",
+        "economics": "business",
+        "legal": "law",
         "computer-science": "computer_science",
     }
 
@@ -182,21 +238,59 @@ def infer_domain(
         *[str(name) for name in (source_names or [])],
     ]).lower()
 
+    # Split file names like "ECE298_Embedded_Project.pdf" into words too.
+    searchable_text = re.sub(r"[_\-./]+", " ", searchable_text)
+
     scores = {
-        domain: sum(
-            1
-            for keyword in keywords
-            if keyword in searchable_text
-        )
+        domain: sum(len(_keyword_pattern(keyword).findall(searchable_text)) for keyword in keywords)
         for domain, keywords in DOMAIN_KEYWORDS.items()
     }
 
     best_domain = max(scores, key=scores.get)
 
-    if scores[best_domain] == 0:
+    # Need a clear signal: at least two hits, or one hit with no competitor.
+    ranked = sorted(scores.values(), reverse=True)
+    if ranked[0] == 0 or (ranked[0] == 1 and ranked[1] == 1):
         return "general"
 
     return best_domain
+
+
+_PATTERNS = {}
+
+
+def _keyword_pattern(keyword: str):
+    pattern = _PATTERNS.get(keyword)
+    if pattern is None:
+        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])")
+        _PATTERNS[keyword] = pattern
+    return pattern
+
+
+SUBJECT_LABELS = {
+    "art_history": "art and visual history",
+    "engineering": "engineering",
+    "mathematics": "mathematics",
+    "science": "the sciences",
+    "medicine": "medicine and health",
+    "computer_science": "computer science",
+    "business": "business and economics",
+    "law": "law",
+    "humanities": "the humanities",
+}
+
+
+def subject_guidance(question: str, source_names: Optional[Iterable[str]] = None, domain: str = "auto") -> str:
+    """Extra system-prompt lines for the subject this question belongs to ("" when unclear)."""
+    chosen = normalize_domain(domain)
+    if chosen == "auto":
+        chosen = infer_domain(question=question, source_names=source_names)
+    if chosen == "general" or chosen not in DOMAIN_PROFILES:
+        return ""
+    return (
+        f"SUBJECT GUIDANCE — this looks like {SUBJECT_LABELS.get(chosen, chosen)} work "
+        "(use it only if it fits the question):\n" + DOMAIN_PROFILES[chosen].strip()
+    )
 
 
 def build_system_prompt(
@@ -224,4 +318,4 @@ def build_system_prompt(
         "TASK GUIDANCE:\n" + TASK_PROFILES[chosen_task].strip(),
     ])
 
-    return system_prompt, chosen_domain
+    return system_prompt, chosen_domain

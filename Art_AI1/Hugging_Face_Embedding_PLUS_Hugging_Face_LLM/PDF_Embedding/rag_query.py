@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from gemini_embedding import embed_query
 from db import search_chunks, get_stats
 from gemini_client import generate_text, generate_image
-from prompt_profiles import build_system_prompt
+from prompt_profiles import build_system_prompt, subject_guidance
 
 TOP_K = 3
 
@@ -384,7 +384,7 @@ Requirements:
 
     answer = generate_text(
         prompt=prompt,
-        system_instruction=RESEARCH_SYSTEM_INSTRUCTION,
+        system_instruction=_with_subject(RESEARCH_SYSTEM_INSTRUCTION, question, selected_sources),
         temperature=0.15,
         max_output_tokens=8192,
     )
@@ -394,6 +394,16 @@ Requirements:
         "chunks": all_chunks,
         "mode": "text_rag",
     }
+
+def _with_subject(base: str, question: str, sources=None, domain: str = "auto") -> str:
+    """Add field-specific guidance (engineering, maths, science, law…) when the subject is clear."""
+    try:
+        extra = subject_guidance(question, sources or [], domain)
+    except Exception as error:  # never block an answer on this
+        print(f"[RAG] subject guidance skipped: {type(error).__name__}: {error}")
+        extra = ""
+    return f"{base}\n\n{extra}" if extra else base
+
 
 def query_general(
     question: str,
@@ -425,7 +435,7 @@ Current user question:
 
     answer = generate_text(
         prompt=prompt,
-        system_instruction=GENERAL_SYSTEM_INSTRUCTION,
+        system_instruction=_with_subject(GENERAL_SYSTEM_INSTRUCTION, question, [], domain),
         temperature=0.3,
         max_output_tokens=8192,
     )
