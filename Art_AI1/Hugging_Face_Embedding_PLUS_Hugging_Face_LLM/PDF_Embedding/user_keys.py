@@ -5,7 +5,7 @@ Express (the only caller; protected by the internal API key) may send:
 
     X-User-Gemini-Key   the user's Gemini key: used for embeddings
                         (indexing + search) and for Gemini answers
-    X-Answer-Provider   nexo | gemini | openai | anthropic | groq | qwen
+    X-Answer-Provider   nexo | gemini | openai | anthropic | groq | qwen | deepseek
     X-Answer-Key        key for the answer provider (all but gemini)
     X-Answer-Model      model id chosen by the user (optional)
     X-Answer-Endpoint   qwen only: region code, e.g. "intl", "us", "cn"
@@ -25,8 +25,8 @@ from contextvars import ContextVar
 
 import re
 
-PROVIDERS = {"nexo", "gemini", "openai", "anthropic", "groq", "qwen"}
-KEYED_PROVIDERS = ("openai", "anthropic", "groq", "qwen")
+PROVIDERS = {"nexo", "gemini", "openai", "anthropic", "groq", "qwen", "deepseek"}
+KEYED_PROVIDERS = ("openai", "anthropic", "groq", "qwen", "deepseek")
 
 # Alibaba Cloud Model Studio (Qwen), OpenAI-compatible mode. Keys are bound
 # to the region they were created in.

@@ -64,10 +64,12 @@ PROVIDER_NAMES = {
     "anthropic": "Claude (Anthropic)",
     "groq": "Groq (Llama)",
     "qwen": "Qwen (Alibaba Cloud)",
+    "deepseek": "DeepSeek",
 }
 
 # Free / low-cost providers with an OpenAI-compatible chat API.
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 
 def _gemini_url(model: str = "") -> str:
@@ -272,7 +274,7 @@ def _generate_openai(prompt, system_instruction, temperature, max_output_tokens,
 
 
 def _generate_compatible(provider, base_url, prompt, system_instruction, temperature, max_output_tokens, key, model):
-    """Groq (Llama), Qwen and other OpenAI-compatible chat APIs."""
+    """Groq (Llama), Qwen, DeepSeek and other OpenAI-compatible chat APIs."""
     name = PROVIDER_NAMES.get(provider, provider)
     messages = []
     if system_instruction:
@@ -539,6 +541,12 @@ def generate_text(
         return _generate_compatible(
             "groq", GROQ_BASE_URL, prompt, system_instruction, temperature, max_output_tokens, user_key,
             user_model or os.getenv("GROQ_DEFAULT_MODEL", "llama-3.3-70b-versatile"),
+        )
+
+    if provider == "deepseek" and user_key:
+        return _generate_compatible(
+            "deepseek", DEEPSEEK_BASE_URL, prompt, system_instruction, temperature, max_output_tokens, user_key,
+            user_model or os.getenv("DEEPSEEK_DEFAULT_MODEL", "deepseek-flash"),
         )
 
     if provider == "qwen" and user_key:
