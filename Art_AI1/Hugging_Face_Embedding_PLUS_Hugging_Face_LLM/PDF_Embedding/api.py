@@ -48,6 +48,7 @@ from image_tools import IMAGE_EXTENSIONS, crop_region, prepare_image
 import user_keys
 from gemini_client import UserKeyError, ask_about_drawing, read_drawing
 from rag_query import query_general, query_text_rag
+from agent_plan import plan_canvas_actions
 
 
 load_dotenv()
@@ -266,6 +267,7 @@ async def query_general_endpoint(
     chat_history: str = Form("[]"),
     domain: str = Form("auto"),
     task: str = Form("answer"),
+    preferences: str = Form(""),
 ):
     history = parse_chat_history(chat_history)
     request_keys = user_keys.from_headers(request.headers)
@@ -281,6 +283,7 @@ async def query_general_endpoint(
                 chat_history=history,
                 domain=domain,
                 task=task,
+                preferences=preferences,
             )
 
     try:
@@ -321,6 +324,7 @@ async def query_text_endpoint(
     source_filter: Optional[str] = Form(None),
     chat_history: str = Form("[]"),
     inline_context: str = Form(""),
+    preferences: str = Form(""),
 ):
     safe_question = question.strip()
     safe_user_id = user_id.strip()
@@ -359,6 +363,7 @@ async def query_text_endpoint(
                 source_filters=selected_sources,
                 chat_history=history,
                 inline_context=inline_context,
+                preferences=preferences,
             )
 
     try:
@@ -758,6 +763,39 @@ async def ask_sketch(
         print(f"[SKETCH ASK ERROR] {type(error).__name__}: {error}")
         raise HTTPException(status_code=502, detail="The AI could not answer right now. Please try again.")
     return {"text": str(text or "").strip()[:20000], "usage": request_keys.get("usage", [])}
+
+
+@app.post(
+    "/agent/plan",
+    dependencies=[Depends(require_api_key)],
+)
+async def agent_plan_endpoint(
+    request: Request,
+    task: str = Form(...),
+    canvas: str = Form("{}"),
+    chat_history: str = Form("[]"),
+    preferences: str = Form(""),
+):
+    """Canvas Agent: a plan of canvas actions for the request (nothing is run here)."""
+    try:
+        canvas_data = json.loads(canvas or "{}")
+    except json.JSONDecodeError:
+        canvas_data = {}
+    history = parse_chat_history(chat_history)
+    request_keys = user_keys.from_headers(request.headers)
+
+    def run():
+        with user_keys.using(request_keys):
+            return plan_canvas_actions(task, canvas_data if isinstance(canvas_data, dict) else {}, history, preferences)
+
+    try:
+        plan = await run_in_threadpool(run)
+    except UserKeyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        print(f"[AGENT PLAN ERROR] {type(error).__name__}: {error}")
+        raise HTTPException(status_code=502, detail="The AI could not make a plan right now. Please try again.")
+    return {**plan, "usage": request_keys.get("usage", [])}
 
 
 @app.get(
