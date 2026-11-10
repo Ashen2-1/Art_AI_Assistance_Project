@@ -17,8 +17,20 @@ Steps:
               (and, for groups, clusters of the same person across images)
   2. SEARCH   the queries run against every indexed source in the
               workspace (books, PDFs, Word, sheets, other image descriptions)
+  2b. WEB     optional ("Search the web for clues"): Gemini with Google
+              Search looks for text clues (inscriptions, studios, places,
+              events, captions) — never a person's appearance
   3. REASON   the answer model weighs observations against the evidence,
-              cites [S1], [S2], and gives calibrated likelihoods
+              cites [S1] / [W1], and gives calibrated likelihoods
+
+Identity is never judged from facial resemblance: likelihoods that two
+images show the same person, or that a person is a named candidate, rest
+on documents and context. Features that change over time (age, facial
+hair, hair, clothing…) are reported as consistent / not diagnostic.
+
+The vision step also returns "markers": boxes on concrete visual details
+(clothing, props, backdrops, inscriptions, stamps…) so the interface can
+point at them on the photos. Faces are never marked.
 
 Vision uses Gemini (the user's key when connected); reasoning follows the
 user's answer provider (NEXO / Gemini / OpenAI / Claude).
@@ -28,7 +40,7 @@ import json
 import re
 from typing import List, Optional
 
-from gemini_client import generate_multimodal, generate_text
+from gemini_client import generate_multimodal, generate_text, web_search
 from rag_query import build_context, retrieve
 
 MAX_EVIDENCE = 16
@@ -44,6 +56,20 @@ PERSON_KEYS = (
     '{"id": "P1", "position": "e.g. standing, second from left", "box": [ymin, xmin, ymax, xmax] (0-1000), '
     '"apparent_age": "", "sex": "", "clothing": "", "hair_and_face": "", "pose_and_action": "", "distinctive_features": ""}'
 )
+
+MARKER_KEYS = (
+    '"markers": [{"id": "M1", "image": "A", "box": [ymin, xmin, ymax, xmax] (0-1000), '
+    '"label": "short name of the detail", "kind": "shared | different | date | place | maker | text | object | condition", '
+    '"group": "the same short key for the same detail seen in several images, else empty"}]'
+)
+
+MARKER_RULES = """
+Markers: point at 3-10 concrete visual details that matter for dating, placing,
+attributing or linking the images — clothing details, buttons, jewellery, uniforms,
+backdrops, walls, furniture, props, buildings, inscriptions, studio stamps, mounts,
+damage, signs of the photographic process. Boxes must tightly enclose the detail.
+Never mark faces or facial features, and never use facial resemblance as a reason.
+""".strip()
 
 IMAGE_KEYS = f"""
   "medium": "photograph | oil painting | watercolour | drawing | sketch | print/engraving | other",
@@ -64,8 +90,10 @@ Examine the image and return JSON:
 {{
 {IMAGE_KEYS},
   "focus_person": "if a FOCUS crop is provided: which person in the full image it shows (id) and a detailed description, else empty",
+  {MARKER_KEYS},
   "search_queries": ["4-6 short archive search queries: names or words from visible text, distinctive objects, place and era terms"]
 }}
+{MARKER_RULES}
 """.strip()
 
 LOOK_TWO = f"""
@@ -75,12 +103,19 @@ the person the researcher cares about). Return JSON:
   "image_a": {{ {IMAGE_KEYS} }},
   "image_b": {{ {IMAGE_KEYS} }},
   "comparison": {{
-    "same_person_likelihood": 0-100 or null, "same_place_likelihood": 0-100 or null, "same_maker_likelihood": 0-100 or null,
-    "shared_features": [""], "differences": [""], "notes": ""
+    "same_place_likelihood": 0-100 or null, "same_maker_likelihood": 0-100 or null,
+    "shared_features": [""],
+    "differences": ["differences that time alone cannot explain (e.g. different process, different building)"],
+    "changes_with_time": ["differences that could simply come from years passing: age, facial hair, hair, weight, clothing, setting"],
+    "person_context": "non-facial context that links or separates the people (same sitting, props, captions), or empty",
+    "notes": ""
   }},
+  {MARKER_KEYS},
   "search_queries": ["4-6 short archive search queries covering both images"]
 }}
-Likelihoods above 80 need several independent matching details (face shape, ears, hairline, scars, posture...).
+{MARKER_RULES}
+In markers, give a detail seen in both images the same "group" key and kind "shared".
+Do not estimate whether the people are the same person from their faces.
 """.strip()
 
 LOOK_GROUP = f"""
@@ -93,15 +128,19 @@ person; some may show several people. Return JSON:
       "visible_text": [{{"text": "", "where": ""}}], "date_clues": [""], "place_clues": [""], "maker_clues": [""]}}
   ],
   "clusters": [
-    {{"cluster_id": "C1", "members": ["A-P1", "C-P2"], "same_person_likelihood": 0-100,
+    {{"cluster_id": "C1", "members": ["A-P1", "C-P2"], "link": "the non-facial context that links them",
       "shared_features": ["specific matching details"], "doubts": ["differences"]}}
   ],
+  {MARKER_KEYS},
   "search_queries": ["5-8 short archive search queries covering all images"]
 }}
 Person references are "<image label>-<person id>". Put every person in
-exactly one cluster (a cluster may have one member). Only group people when
-several independent details match; age differences between images are
-possible. Prefer focus persons as the first cluster.
+exactly one cluster (a cluster may have one member). Only put people from
+different images in one cluster when NON-FACIAL context links them: the same
+sitting (same clothes, setting and props), a caption or inscription naming
+them, or their place in a numbered series. Never group by facial resemblance.
+Prefer focus persons as the first cluster.
+{MARKER_RULES}
 """.strip()
 
 REASON_SYSTEM = """
@@ -115,12 +154,39 @@ weigh visual observations against documentary evidence. Rules:
 - Separate what is SEEN in the image from what is INFERRED.
 - If the researcher marked a focus person, the identification is about
   THAT person; mention others only as context.
+- Never judge identity from facial resemblance. Likelihoods about WHO a
+  person is (candidates, same person) rest only on documentary evidence
+  (captions, inscriptions, names in the sources, credits, provenance, dated
+  records, web pages) and context (same sitting, studio, props, events whose
+  dates fit). Without such evidence keep them low and say what is missing.
+  Give each likelihood a "basis": documentary | contextual | visual only.
+- Features that change with time — apparent age, facial hair, hair length
+  and colour, weight, clothing, setting, colour vs black-and-white — are NOT
+  evidence against two images showing the same person or place when they
+  may be years apart. Put them under "consistent_not_diagnostic", never
+  under evidence against. Evidence against must be a fixed fact (documented
+  identities, dates or places that cannot both be true).
+- If the researcher states a hypothesis (e.g. "the same man at different
+  ages"), test it explicitly in "hypothesis_check".
+- Web results [W#] may be wrong or about another subject: prefer primary
+  sources (archives, museums, publishers, newspapers) and say how reliable
+  each is.
 Return only valid JSON.
 """.strip()
 
 CANDIDATE_SHAPE = (
     '{"name": "", "kind": "sitter | maker | place | object | other", "likelihood": 0-100, '
-    '"evidence_for": ["reason with citation [S#]"], "evidence_against": [""]}'
+    '"basis": "documentary | contextual | visual only", '
+    '"evidence_for": ["reason with citation [S#] or [W#]"], "evidence_against": ["fixed facts only"]}'
+)
+
+HYPOTHESIS_SHAPE = (
+    '{"hypothesis": "the researcher\'s hypothesis in one line, or empty if none", '
+    '"verdict": "supported | consistent but unproven | contradicted | cannot tell", '
+    '"supports": ["documentary or contextual evidence for it, with citations"], '
+    '"consistent_not_diagnostic": ["observations that fit it but prove nothing (e.g. beard grown, older)"], '
+    '"contradicts": ["fixed facts against it, with citations"], '
+    '"would_settle": ["the evidence that would decide it"]}'
 )
 
 REASON_SINGLE = """
@@ -133,10 +199,12 @@ VISUAL OBSERVATIONS:
 
 EVIDENCE FROM THE WORKSPACE SOURCES:
 {evidence}
+{web_evidence}
 
 Return JSON:
 {{
   "summary": "3-5 sentences with citations",
+  "hypothesis_check": {hypothesis},
   "candidates": [{candidate}],
   "unidentified": "if no candidate is supported: what the image shares with the sources and what would identify it, else empty",
   "date_estimate": {{"range": "", "confidence": "low | medium | high", "reasoning": ""}},
@@ -145,6 +213,7 @@ Return JSON:
   "similar_items": [{{"source": "file name", "citation": "S#", "shared_features": ""}}],
   "comparison": {compare_shape},
   "transcribed_text": [""],
+  "missing_evidence": ["what would raise or lower the likelihoods"],
   "open_questions": [""],
   "next_steps": [""]
 }}
@@ -161,12 +230,14 @@ VISUAL OBSERVATIONS (with proposed clusters of the same person):
 
 EVIDENCE FROM THE WORKSPACE SOURCES:
 {evidence}
+{web_evidence}
 
 Return JSON:
 {{
   "summary": "4-6 sentences: how many distinct people, who they probably are, with citations",
+  "hypothesis_check": {hypothesis},
   "people": [
-    {{"cluster_id": "C1", "members": ["A-P1", "C-P2"], "same_person_likelihood": 0-100,
+    {{"cluster_id": "C1", "members": ["A-P1", "C-P2"], "same_person_likelihood": 0-100 (documentary / contextual links only),
       "label": "short description, e.g. bearded man in frock coat",
       "candidates": [{candidate}],
       "shared_features": [""], "doubts": [""]}}
@@ -176,9 +247,31 @@ Return JSON:
   "maker_estimate": {{"value": "", "confidence": "low | medium | high", "reasoning": ""}},
   "similar_items": [{{"source": "file name", "citation": "S#", "shared_features": ""}}],
   "transcribed_text": [""],
+  "missing_evidence": [""],
   "open_questions": [""],
   "next_steps": [""]
 }}
+""".strip()
+
+WEB_SYSTEM = """
+You research historical photographs, paintings and drawings on the web for
+an archive researcher. Search only TEXT clues: words and names visible in the
+image, names already given by the researcher or the sources, studios,
+photographers, publishers, places, buildings, events, objects and dates.
+Never search by describing a person's face or body, and never try to name a
+person from their appearance. Report only what pages actually say.
+""".strip()
+
+WEB_PROMPT = """
+Find documentary clues on the web for this investigation.
+{question_line}
+
+What the images show (from a visual analysis):
+{clues}
+
+Write 4-8 short findings. Each: what the page says and why it matters
+(who made or published the image, where it is held, a caption, a date, a
+place, a related event). Say plainly if nothing relevant was found.
 """.strip()
 
 
@@ -247,6 +340,56 @@ def _gather_evidence(queries: List[str], user_id: str, canvas_id: str, source_fi
     return best
 
 
+MARKER_KINDS = {"shared", "different", "date", "place", "maker", "text", "object", "condition"}
+
+
+def _clean_markers(observations: dict, labels: List[str]) -> List[dict]:
+    """Boxes the interface draws on the photos (never faces — see MARKER_RULES)."""
+    out = []
+    for index, item in enumerate(observations.get("markers") or []):
+        if not isinstance(item, dict):
+            continue
+        box = _clean_box(item.get("box"))
+        image = str(item.get("image") or labels[0]).strip().upper()[:1]
+        label = str(item.get("label") or "").strip()[:80]
+        if not box or image not in labels or not label:
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        out.append({
+            "id": f"M{len(out) + 1}",
+            "image": image,
+            "box": box,
+            "label": label,
+            "kind": kind if kind in MARKER_KINDS else "object",
+            "group": str(item.get("group") or "").strip().lower()[:40],
+        })
+        if len(out) >= 24:
+            break
+    return out
+
+
+def _web_clues(observations: dict, blocks: List[dict], question: str, focus_line: str) -> dict:
+    """Optional web step: text clues only (see WEB_SYSTEM)."""
+    lines = []
+    for block in blocks:
+        block = block or {}
+        for key, title in (("subject_summary", "Subject"), ("medium", "Medium"), ("process_or_technique", "Process"), ("objects_and_setting", "Setting")):
+            if block.get(key):
+                lines.append(f"- {title}: {str(block[key])[:300]}")
+        texts = [str(item.get("text")) for item in block.get("visible_text") or [] if isinstance(item, dict) and item.get("text")]
+        if texts:
+            lines.append("- Visible text: " + " | ".join(texts)[:400])
+        for key, title in (("date_clues", "Date clues"), ("place_clues", "Place clues"), ("maker_clues", "Maker clues")):
+            values = [str(value) for value in block.get(key) or [] if value]
+            if values:
+                lines.append(f"- {title}: " + "; ".join(values)[:300])
+    queries = [str(query) for query in observations.get("search_queries") or []][:6]
+    if queries:
+        lines.append("- Suggested searches: " + "; ".join(queries))
+    question_line = "\n".join(part for part in (f"The researcher asks: {question.strip()}" if question.strip() else "", focus_line) if part)
+    return web_search(WEB_PROMPT.format(question_line=question_line, clues="\n".join(lines)[:5000] or "- (no clues)"), system_instruction=WEB_SYSTEM)
+
+
 def _labels(count: int) -> List[str]:
     return [chr(ord("A") + index) for index in range(count)]
 
@@ -257,9 +400,11 @@ def analyze(
     canvas_id: str = "default",
     question: str = "",
     source_filters: Optional[List[str]] = None,
+    web: bool = False,
 ) -> dict:
     """
     images: [{"path", "name", "focus_path" (optional crop), "focus_note"}]
+    web: also search the web for text clues (inscriptions, studios, places…).
     """
     images = images[:MAX_IMAGES]
     count = len(images)
@@ -319,7 +464,34 @@ def analyze(
         queries = [observations.get("subject_summary") or "historical photograph"]
     evidence = _gather_evidence(queries[:10], user_id, canvas_id, source_filters or [])
     evidence_text = build_context(evidence) if evidence else "No indexed passages matched. Base the report on the images only and say so."
+    markers = _clean_markers(observations, labels)
+    observations.pop("markers", None)
     observations_text = json.dumps(observations, ensure_ascii=False, indent=1)[:16000]
+
+    # 2b. WEB (optional): documentary clues from the web, cited as [W1], [W2]…
+    web_sources, web_note, web_queries = [], "", []
+    if web:
+        try:
+            found = _web_clues(observations, blocks, question, focus_line)
+            web_queries = found.get("queries") or []
+            for index, item in enumerate(found.get("sources") or [], start=1):
+                web_sources.append({"citation_id": f"W{index}", "title": item["title"], "url": item["url"], "text": item.get("text") or ""})
+            summary = (found.get("text") or "").strip()
+            web_lines = [f"[{item['citation_id']}] {item['title']} — {item['url']}\n{item['text'] or '(no excerpt)'}" for item in web_sources]
+            web_evidence = (
+                "EVIDENCE FROM THE WEB (cite as [W#]):\n" + (summary[:3000] + "\n\n" if summary else "") + "\n\n".join(web_lines)
+                if web_sources or summary
+                else "EVIDENCE FROM THE WEB: the web search found nothing relevant."
+            )
+            if not web_sources:
+                web_note = "The web search found no relevant pages."
+        except Exception as error:  # the report still works without the web
+            print(f"[Detective] web search failed: {error}")
+            web_note = "The web search could not run this time, so the report uses your sources only."
+            web_evidence = "EVIDENCE FROM THE WEB: not available."
+    else:
+        web_evidence = ""
+    hypothesis = HYPOTHESIS_SHAPE if question.strip() else "null"
 
     # 3. REASON
     if mode == "group":
@@ -330,6 +502,8 @@ def analyze(
             question_line=question_line,
             observations=observations_text,
             evidence=evidence_text,
+            web_evidence=web_evidence,
+            hypothesis=hypothesis,
             candidate=CANDIDATE_SHAPE,
         )
     else:
@@ -339,8 +513,12 @@ def analyze(
             else f"Identify the image {images[0]['name']}: who is depicted, who made it, when and where."
         )
         compare_shape = (
-            '{"same_person_likelihood": 0-100 or null, "same_place_likelihood": 0-100 or null, '
-            '"same_maker_likelihood": 0-100 or null, "shared_features": [], "differences": [], "verdict": ""}'
+            '{"same_person_likelihood": 0-100 or null (documentary / contextual evidence only, never faces), '
+            '"same_place_likelihood": 0-100 or null, "same_maker_likelihood": 0-100 or null, '
+            '"basis": "what the likelihoods rest on", "shared_features": [], '
+            '"differences": ["only differences time cannot explain"], '
+            '"consistent_not_diagnostic": ["differences that years passing can explain"], '
+            '"missing_evidence": [""], "verdict": ""}'
             if mode == "compare"
             else "null"
         )
@@ -350,6 +528,8 @@ def analyze(
             question_line=question_line,
             observations=observations_text,
             evidence=evidence_text,
+            web_evidence=web_evidence,
+            hypothesis=hypothesis,
             candidate=CANDIDATE_SHAPE,
             compare_shape=compare_shape,
         )
@@ -370,11 +550,18 @@ def analyze(
         person["members"] = [str(member) for member in person.get("members") or []][:MAX_IMAGES * 4]
         people.append(person)
     report["people"] = people
+    if not isinstance(report.get("hypothesis_check"), dict) or not str(report["hypothesis_check"].get("verdict") or "").strip():
+        report["hypothesis_check"] = None
+    if web_note:
+        report["web_note"] = web_note
 
     return {
         "mode": mode,
         "labels": labels,
         "observations": observations,
+        "markers": markers,
         "report": report,
         "evidence": evidence,
+        "web": web_sources,
+        "web_queries": web_queries,
     }

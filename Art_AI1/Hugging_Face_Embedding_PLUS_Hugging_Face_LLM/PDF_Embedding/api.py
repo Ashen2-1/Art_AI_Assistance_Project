@@ -595,9 +595,10 @@ async def detective_analyze(
     question: str = Form(""),
     source_filters: str = Form("[]"),
     focus: str = Form("[]"),
+    web: str = Form("false"),
 ):
     """
-    Photo Detective against the workspace sources:
+    Photo Detective against the workspace sources (and the web when web=true):
     1 image = identify, 2 = compare, 3-12 = group (who appears where).
     focus: JSON list aligned with images, each null or
            {"box": {"x","y","w","h"} as 0-1 fractions, "note": "the man on the left"}.
@@ -648,6 +649,7 @@ async def detective_analyze(
                         canvas_id=canvas_id.strip() or "default",
                         question=question[:1000],
                         source_filters=selected,
+                        web=str(web).strip().lower() in ("1", "true", "yes"),
                     )
 
             result = await run_in_threadpool(run)
@@ -682,8 +684,11 @@ async def detective_analyze(
         "mode": result["mode"],
         "labels": result.get("labels", []),
         "observations": result["observations"],
+        "markers": result.get("markers", []),
         "report": result["report"],
         "sources": sources,
+        "web_sources": result.get("web", []),
+        "web_queries": result.get("web_queries", []),
         "usage": request_keys.get("usage", []),
     }
 

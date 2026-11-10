@@ -729,6 +729,53 @@ def generate_multimodal(
     return _extract_answer(response.json())
 
 
+def web_search(prompt: str, system_instruction: Optional[str] = None, max_output_tokens: int = 3000) -> dict:
+    """
+    Gemini with Google Search grounding: the model writes search queries,
+    reads the results and answers. Returns
+      {"text": "...", "sources": [{"title", "url", "text"}]}
+    where each source carries the sentences of the answer it supports.
+    Only text is searched — no image is sent to the search engine.
+    Uses the person's own Gemini key when connected, otherwise NEXO's.
+    """
+    api_key = user_keys.gemini_key(GEMINI_API_KEY)
+    if not api_key:
+        raise GeminiAPIError("Web search needs a Gemini key.")
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt.strip()}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_output_tokens},
+    }
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction.strip()}]}
+    try:
+        response = _post_gemini(GEMINI_MODEL, api_key, payload, 120)
+    except requests.RequestException as error:
+        raise GeminiAPIError("Could not reach Google Search through Gemini.") from error
+    if not response.ok:
+        raise GeminiAPIError(f"Web search failed (HTTP {response.status_code}): {_read_error_message(response)[:300]}")
+    data = response.json()
+    text = _extract_answer(data)
+    meta = ((data.get("candidates") or [{}])[0].get("groundingMetadata")) or {}
+    chunks = meta.get("groundingChunks") or []
+    sources = []
+    for chunk in chunks:
+        web = chunk.get("web") or {}
+        sources.append({"title": str(web.get("title") or web.get("domain") or "Web page")[:200], "url": str(web.get("uri") or ""), "text": []})
+    for support in meta.get("groundingSupports") or []:
+        sentence = str((support.get("segment") or {}).get("text") or "").strip()
+        for index in support.get("groundingChunkIndices") or []:
+            if sentence and 0 <= index < len(sources) and sentence not in sources[index]["text"]:
+                sources[index]["text"].append(sentence)
+    # The grounding fee is per search request, on top of the tokens (usage dashboard).
+    user_keys.record_usage("gemini", "google-search", 0, 0, "nexo" if api_key == GEMINI_API_KEY else "user", kind="search")
+    return {
+        "text": text,
+        "queries": [str(query) for query in (meta.get("webSearchQueries") or [])][:10],
+        "sources": [{**item, "text": " ".join(item["text"])[:1500]} for item in sources if item["url"].startswith("http")][:12],
+    }
+
+
 SKETCH_READ_SYSTEM = (
     "You read a researcher's handwritten notes and drawings (Apple Pencil / finger) so that an AI "
     "assistant can search and use them. Be faithful: transcribe, do not invent or correct content."
