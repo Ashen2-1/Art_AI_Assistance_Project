@@ -799,6 +799,10 @@ SKETCH_READ_PROMPT = """Read this hand-drawn page.
    curve shape and marked points; for a table: its rows and columns.
 3. If the page is empty or only scribbles, say so in one line.
 
+Keep it clean, it is shown to the writer: put each equation on its own line as $$...$$, keep lists as lists,
+and do NOT add commentary about the handwriting, the transcription or what the writer "probably meant".
+If a word or symbol is really unclear, write [?] in place and, at the very end, one short line "Unsure: …".
+
 Answer in plain text with the headings "Text:" and "Drawings:" (omit a heading when there is nothing for it)."""
 
 
