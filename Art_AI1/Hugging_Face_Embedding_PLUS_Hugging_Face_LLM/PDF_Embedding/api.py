@@ -46,7 +46,7 @@ import ingest_progress
 import detective
 from image_tools import IMAGE_EXTENSIONS, crop_region, prepare_image
 import user_keys
-from gemini_client import UserKeyError, read_drawing
+from gemini_client import UserKeyError, ask_about_drawing, read_drawing
 from rag_query import query_general, query_text_rag
 
 
@@ -721,6 +721,42 @@ async def describe_sketch(request: Request, image: UploadFile = File(...)):
     except Exception as error:
         print(f"[SKETCH READ ERROR] {type(error).__name__}: {error}")
         raise HTTPException(status_code=502, detail="The AI could not read the drawing right now. Please try again.")
+    return {"text": str(text or "").strip()[:20000], "usage": request_keys.get("usage", [])}
+
+
+@app.post(
+    "/describe/sketch/ask",
+    dependencies=[Depends(require_api_key)],
+)
+async def ask_sketch(
+    request: Request,
+    image: UploadFile = File(...),
+    question: str = Form(""),
+    page_text: str = Form(""),
+):
+    """Answer a question about a circled part of a sketch page (e.g. "is this step right?")."""
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The selected part is empty.")
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="The selected part is too large.")
+    suffix = ".png" if (image.content_type or "").endswith("png") else ".jpg"
+    request_keys = user_keys.from_headers(request.headers)
+
+    def run():
+        with tempfile.TemporaryDirectory(prefix="nexo_sketch_ask_") as temp_dir:
+            path = Path(temp_dir) / f"part{suffix}"
+            path.write_bytes(data)
+            with user_keys.using(request_keys):
+                return ask_about_drawing(path, question, page_text)
+
+    try:
+        text = await run_in_threadpool(run)
+    except UserKeyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        print(f"[SKETCH ASK ERROR] {type(error).__name__}: {error}")
+        raise HTTPException(status_code=502, detail="The AI could not answer right now. Please try again.")
     return {"text": str(text or "").strip()[:20000], "usage": request_keys.get("usage", [])}
 
 

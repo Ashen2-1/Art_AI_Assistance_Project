@@ -828,3 +828,46 @@ def read_drawing(image_path) -> str:
             return answer
 
     return generate_image(SKETCH_READ_PROMPT, str(image_path), system_instruction=SKETCH_READ_SYSTEM, temperature=0.1, max_output_tokens=4096)
+
+
+SKETCH_ASK_SYSTEM = (
+    "You are a patient tutor and research assistant looking at part of a student's or researcher's "
+    "handwritten page (circled by them). Answer their question about that part. Be precise and honest: "
+    "when checking working, name the first wrong step and why, then show the corrected step; when the "
+    "work is right, say so plainly. Never invent what is not on the page. Write maths in LaTeX between "
+    "$...$ (inline) or $$...$$ (display). Answer in the language of the question. Keep it short."
+)
+
+
+def ask_about_drawing(image_path, question: str, page_text: str = "") -> str:
+    """
+    Answer a question about a circled part of a hand-drawn page.
+    Same provider order as read_drawing.
+    """
+    question = (question or "").strip()[:2000] or "Explain this part."
+    context = (page_text or "").strip()[:6000]
+    prompt = (
+        "The image is the part of the page the user circled.\n"
+        + (f"For context, the whole page was read as:\n<page>\n{context}\n</page>\n" if context else "")
+        + f"\nQuestion: {question}"
+    )
+    provider, user_key, user_model = user_keys.answer_settings()
+    content = [_claude_image_block(image_path), {"type": "text", "text": prompt}]
+
+    if provider == "anthropic" and user_key:
+        try:
+            response = _claude_request(user_key, user_model or CLAUDE_STRONG_MODEL, content, SKETCH_ASK_SYSTEM, 4096, timeout=150)
+        except requests.RequestException as error:
+            raise UserKeyError(f"Could not reach Anthropic: {error}") from error
+        if not response.ok:
+            _raise_user_provider_error("anthropic", response)
+        answer = _claude_text(response.json())
+        if answer:
+            return answer
+
+    if provider not in ("anthropic", "gemini"):
+        answer = _nexo_claude(content, SKETCH_ASK_SYSTEM, 3072, heavy=True, timeout=150)
+        if answer:
+            return answer
+
+    return generate_image(prompt, str(image_path), system_instruction=SKETCH_ASK_SYSTEM, temperature=0.2, max_output_tokens=3072)
