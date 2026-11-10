@@ -266,6 +266,7 @@ def query_text_rag(
     source_filter=None,
     chat_history=None,
     inline_context: str = "",
+    preferences: str = "",
 ):
     safe_user_id = str(user_id or "").strip()
 
@@ -384,7 +385,7 @@ Requirements:
 
     answer = generate_text(
         prompt=prompt,
-        system_instruction=_with_subject(RESEARCH_SYSTEM_INSTRUCTION, question, selected_sources),
+        system_instruction=_with_subject(RESEARCH_SYSTEM_INSTRUCTION, question, selected_sources, preferences=preferences),
         temperature=0.15,
         max_output_tokens=8192,
     )
@@ -395,14 +396,27 @@ Requirements:
         "mode": "text_rag",
     }
 
-def _with_subject(base: str, question: str, sources=None, domain: str = "auto") -> str:
-    """Add field-specific guidance (engineering, maths, science, law…) when the subject is clear."""
+def _with_subject(base: str, question: str, sources=None, domain: str = "auto", preferences: str = "") -> str:
+    """
+    Add field-specific guidance (engineering, maths, science, law…) when the
+    subject is clear, and the user's saved preferences ("answer in Chinese",
+    "show full derivations"). Preferences never override the source rules.
+    """
     try:
         extra = subject_guidance(question, sources or [], domain)
     except Exception as error:  # never block an answer on this
         print(f"[RAG] subject guidance skipped: {type(error).__name__}: {error}")
         extra = ""
-    return f"{base}\n\n{extra}" if extra else base
+    parts = [base]
+    if extra:
+        parts.append(extra)
+    prefs = str(preferences or "").strip()[:2000]
+    if prefs:
+        parts.append(
+            "THE USER'S SAVED PREFERENCES (follow them unless they conflict with the rules above or "
+            "with the current question):\n" + prefs
+        )
+    return "\n\n".join(parts)
 
 
 def query_general(
@@ -410,6 +424,7 @@ def query_general(
     chat_history: list = None,
     domain: str = "auto",
     task: str = "answer",
+    preferences: str = "",
 ) -> dict:
     """
     General chat without document retrieval.
@@ -435,7 +450,7 @@ Current user question:
 
     answer = generate_text(
         prompt=prompt,
-        system_instruction=_with_subject(GENERAL_SYSTEM_INSTRUCTION, question, [], domain),
+        system_instruction=_with_subject(GENERAL_SYSTEM_INSTRUCTION, question, [], domain, preferences=preferences),
         temperature=0.3,
         max_output_tokens=8192,
     )
