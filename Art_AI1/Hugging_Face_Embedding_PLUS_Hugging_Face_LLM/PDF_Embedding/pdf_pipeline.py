@@ -50,6 +50,14 @@ DEFAULT_CHUNK_OVERLAP = 200
 # time in grayscale (~15 MB each), so 400 DPI is affordable.
 OCR_DPI               = int(os.getenv("OCR_DPI", "400"))
 MAX_OCR_PIXELS        = 30_000_000  # very large pages (posters, maps) are scaled down
+# Long PDFs (books) are read with poppler's pdftotext: a whole book in a few
+# seconds. pdfplumber's column-aware reader took ~0.5 s per page on Render,
+# so a 600-page textbook ran past the 15-minute upload limit.
+FAST_TEXT_MIN_PAGES   = int(os.getenv("FAST_TEXT_MIN_PAGES", "40"))
+# Books: bigger passages so a 600-page book is not 3,000+ embedding requests
+# (the free Gemini tier allows ~100 a minute and a daily cap).
+MAX_DOC_CHUNKS        = int(os.getenv("MAX_DOC_CHUNKS", "1200"))
+MAX_CHUNK_SIZE        = int(os.getenv("MAX_CHUNK_SIZE", "3000"))
 
 
 
@@ -624,6 +632,31 @@ def _extract_pypdf(pdf_path: str) -> str:
     return "\n\n".join(pages)
 
 
+def _extract_pdftotext(pdf_path: str) -> tuple:
+    """
+    Fast digital-text reader (poppler pdftotext, reading order with columns).
+    Returns (text with [Page N] headers, page count); raises if unavailable.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["pdftotext", "-enc", "UTF-8", "-eol", "unix", pdf_path, "-"],
+        capture_output=True,
+        timeout=180,
+        check=True,
+    )
+    pages = result.stdout.decode("utf-8", errors="replace").split("\f")
+    if pages and not pages[-1].strip():
+        pages = pages[:-1]
+    parts = []
+    for index, page in enumerate(pages):
+        text = page.strip()
+        if text.strip():
+            parts.append(f"[Page {index + 1}]\n{text}\n\n")
+    report_progress("reading", 1, 2)
+    return "".join(parts), len(pages)
+
+
 def _is_scanned(text: str, num_pages: int) -> bool:
     """True if avg chars/page < MIN_CHARS_PER_PAGE (image-only PDF)."""
     if num_pages == 0:
@@ -659,8 +692,26 @@ def extract_pdf_text(pdf_path: str, ocr_mode: str = "printed") -> str:
     print(f"\n[PDF Pipeline] -- Processing : {os.path.basename(pdf_path)}")
     print(f"[PDF Pipeline]    OCR mode   : {mode_label}")
 
+    # -- Step 0: long PDFs -> fast pdftotext ------------------------
+    skip_plumber = False
+    if _pdf_page_count(pdf_path) >= FAST_TEXT_MIN_PAGES:
+        try:
+            text, num_pages = _extract_pdftotext(pdf_path)
+            avg = len(text.strip()) // max(num_pages, 1)
+            if _is_scanned(text, num_pages):
+                # Little text: a scanned book. pdfplumber would only find the same.
+                print(f"[PDF Pipeline] Scanned PDF detected (~{avg} chars/page, pdftotext) -> OCR")
+                skip_plumber = True
+            elif not is_bad_pdf_text(text):
+                print(f"[PDF Pipeline] OK pdftotext  |  {num_pages} pages  |  ~{avg} chars/page")
+                return text
+        except Exception as e:
+            print(f"[PDF Pipeline] pdftotext error: {e} -> trying pdfplumber")
+
     # -- Step 1: pdfplumber -----------------------------------------
     try:
+        if skip_plumber:
+            raise RuntimeError("scanned PDF")
         text, num_pages = _extract_pdfplumber(pdf_path)
         avg = len(text.strip()) // max(num_pages, 1)
 
@@ -949,6 +1000,12 @@ def process_pdf(
         raise ValueError(
             "The extracted PDF text is unreadable and will not be indexed."
         )
+
+    if len(text) / max(1, chunk_size) > MAX_DOC_CHUNKS:
+        grown = min(MAX_CHUNK_SIZE, -(-len(text) // MAX_DOC_CHUNKS))
+        if grown > chunk_size:
+            print(f"[PDF Pipeline] Long document ({len(text):,} chars): passages of ~{grown} chars instead of {chunk_size}")
+            chunk_size = grown
 
     chunks = chunk_text(text, chunk_size, chunk_overlap)
 
