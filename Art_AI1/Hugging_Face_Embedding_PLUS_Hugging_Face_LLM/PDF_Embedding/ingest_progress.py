@@ -91,6 +91,19 @@ def set_stage(job_id: str, stage: str, done: int = 0, total: int = 0) -> None:
         )
 
 
+def set_result(job_id: str, result: Optional[dict] = None, error: Optional[str] = None) -> None:
+    """Keep the outcome, so a caller whose upload request timed out can still collect it."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        if result is not None:
+            job["result"] = result
+        if error:
+            job["error"] = str(error)[:500]
+        job["updated"] = time.time()
+
+
 def get(job_id: str, user_id: str) -> Optional[dict]:
     with _lock:
         job = _jobs.get(job_id)

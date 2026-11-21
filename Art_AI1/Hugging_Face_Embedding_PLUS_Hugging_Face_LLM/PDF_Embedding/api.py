@@ -541,7 +541,7 @@ async def ingest_document(
             canvas_id=safe_canvas_id,
         )
 
-        return {
+        result = {
             "status": "ok",
             "file": original_filename,
             "user_id": safe_user_id,
@@ -551,6 +551,10 @@ async def ingest_document(
             "sources": stats["sources"],
             "usage": request_keys.get("usage", []),
         }
+        if safe_job_id:
+            # Kept for a caller whose request timed out (it polls the progress).
+            ingest_progress.set_result(safe_job_id, {key: value for key, value in result.items() if key != "sources"})
+        return result
 
     except HTTPException:
         if safe_job_id:
@@ -561,6 +565,8 @@ async def ingest_document(
         if safe_job_id:
             ingest_progress.set_stage(safe_job_id, "error")
         print(f"[INGEST QUOTA] {original_filename}: daily={error.daily} {error}")
+        if safe_job_id:
+            ingest_progress.set_result(safe_job_id, error=quota_error_message(error))
 
         raise HTTPException(status_code=429, detail=quota_error_message(error))
 
@@ -569,6 +575,8 @@ async def ingest_document(
         if safe_job_id:
             ingest_progress.set_stage(safe_job_id, "error")
         print(f"[INGEST REJECTED] {original_filename}: {error}")
+        if safe_job_id:
+            ingest_progress.set_result(safe_job_id, error=str(error))
 
         raise HTTPException(status_code=422, detail=str(error))
 
@@ -582,6 +590,7 @@ async def ingest_document(
 
         if safe_job_id:
             ingest_progress.set_stage(safe_job_id, "error")
+            ingest_progress.set_result(safe_job_id, error=f"Document ingestion failed: {error}")
 
         if request_keys.get("gemini_key") and _looks_like_bad_key(error):
             raise HTTPException(status_code=400, detail=OWN_GEMINI_KEY_REJECTED)
