@@ -599,7 +599,19 @@ def _extract_pdfplumber(pdf_path: str) -> tuple:
         for i, page in enumerate(pdf.pages):
             # Digital pages are fast; count them as the first half of "reading".
             report_progress("reading", i + 1, num_pages * 2)
-            text = _extract_page_text_smart(page)
+            try:
+                text = _extract_page_text_smart(page)
+            finally:
+                # pdfplumber keeps every parsed page (all its characters and
+                # shapes) until the file closes: a 300-page book filled the
+                # 512 MB server. Drop each page once it is read.
+                try:
+                    page.close()
+                except Exception:
+                    try:
+                        page.flush_cache()
+                    except Exception:
+                        pass
             if text:
                 full_text += f"[Page {i + 1}]\n{text}\n\n"
     return full_text, num_pages

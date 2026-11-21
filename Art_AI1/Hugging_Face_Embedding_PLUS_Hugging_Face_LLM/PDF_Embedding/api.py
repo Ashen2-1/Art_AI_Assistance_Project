@@ -44,6 +44,8 @@ from embed_pipeline import ingest_document as index_document_file
 from gemini_embedding import GeminiQuotaError
 import ingest_progress
 import detective
+from memory_guard import heavy_slot, release_memory
+import shutil
 from image_tools import IMAGE_EXTENSIONS, crop_region, prepare_image
 import user_keys
 from gemini_client import UserKeyError, ask_about_drawing, read_drawing
@@ -486,23 +488,30 @@ async def ingest_document(
         ) as temp_dir:
             tmp_path = Path(temp_dir) / original_filename
 
-            file_content = await file.read()
-            tmp_path.write_bytes(file_content)
+            # Stream the upload to disk (reading it whole kept a second copy of the file in memory).
+            def save_upload():
+                file.file.seek(0)
+                with open(tmp_path, "wb") as out:
+                    shutil.copyfileobj(file.file, out, 1024 * 1024)
+
+            await run_in_threadpool(save_upload)
 
             def run_ingest():
-                # Pipeline steps report progress to this job (see ingest_progress.py).
-                ingest_progress.bind(safe_job_id or None)
-                try:
-                    # The uploader's own Gemini key (if any) pays for the embeddings.
-                    with user_keys.using(request_keys):
-                        return index_document_file(
-                            pdf_path=str(tmp_path),
-                            user_id=safe_user_id,
-                            canvas_id=safe_canvas_id,
-                            ocr_mode=ocr_mode,
-                        )
-                finally:
-                    ingest_progress.bind(None)
+                # One document at a time (memory_guard.py); others wait as "queued".
+                with heavy_slot(f"ingest {original_filename}"):
+                    # Pipeline steps report progress to this job (see ingest_progress.py).
+                    ingest_progress.bind(safe_job_id or None)
+                    try:
+                        # The uploader's own Gemini key (if any) pays for the embeddings.
+                        with user_keys.using(request_keys):
+                            return index_document_file(
+                                pdf_path=str(tmp_path),
+                                user_id=safe_user_id,
+                                canvas_id=safe_canvas_id,
+                                ocr_mode=ocr_mode,
+                            )
+                    finally:
+                        ingest_progress.bind(None)
 
             if safe_job_id:
                 ingest_progress.start(safe_job_id, safe_user_id, original_filename)
@@ -647,7 +656,7 @@ async def detective_analyze(
                 prepared.append(item)
 
             def run():
-                with user_keys.using(request_keys):
+                with heavy_slot("detective"), user_keys.using(request_keys):
                     return detective.analyze(
                         images=prepared,
                         user_id=safe_user_id,
