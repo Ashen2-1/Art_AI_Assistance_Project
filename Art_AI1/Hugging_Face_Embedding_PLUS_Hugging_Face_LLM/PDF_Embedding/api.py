@@ -497,21 +497,21 @@ async def ingest_document(
             await run_in_threadpool(save_upload)
 
             def run_ingest():
-                # One document at a time (memory_guard.py); others wait as "queued".
-                with heavy_slot(f"ingest {original_filename}"):
-                    # Pipeline steps report progress to this job (see ingest_progress.py).
-                    ingest_progress.bind(safe_job_id or None)
-                    try:
-                        # The uploader's own Gemini key (if any) pays for the embeddings.
-                        with user_keys.using(request_keys):
-                            return index_document_file(
-                                pdf_path=str(tmp_path),
-                                user_id=safe_user_id,
-                                canvas_id=safe_canvas_id,
-                                ocr_mode=ocr_mode,
-                            )
-                    finally:
-                        ingest_progress.bind(None)
+                # Reading is one document at a time (embed_pipeline -> memory_guard.py).
+                # Pipeline steps report progress to this job (see ingest_progress.py).
+                ingest_progress.bind(safe_job_id or None)
+                try:
+                    # The uploader's own Gemini key (if any) pays for the embeddings.
+                    with user_keys.using(request_keys):
+                        return index_document_file(
+                            pdf_path=str(tmp_path),
+                            user_id=safe_user_id,
+                            canvas_id=safe_canvas_id,
+                            ocr_mode=ocr_mode,
+                        )
+                finally:
+                    ingest_progress.bind(None)
+                    release_memory()
 
             if safe_job_id:
                 ingest_progress.start(safe_job_id, safe_user_id, original_filename)

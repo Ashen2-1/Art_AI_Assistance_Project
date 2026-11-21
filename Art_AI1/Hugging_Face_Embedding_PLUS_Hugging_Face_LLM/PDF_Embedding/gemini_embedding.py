@@ -85,12 +85,37 @@ class GeminiQuotaError(GeminiEmbeddingError):
 
 
 class _MinuteWindow:
-    """Thread-safe sliding 60-second budget shared by ingestion and queries."""
+    """
+    Thread-safe sliding 60-second budget shared by ingestion and queries.
 
-    def __init__(self, limit: int):
+    adaptive=True (a user's own key, whose tier we do not know): start like a
+    free key, speed up while Google accepts, and remember the speed at which
+    it said "too many requests".
+    """
+
+    def __init__(self, limit: int, adaptive: bool = False, max_limit: int = 0):
         self.limit = limit
+        self.adaptive = adaptive
+        self.max_limit = max_limit or limit
+        self.last_throttle = 0.0
         self.events = deque()  # (timestamp, item_count)
         self.lock = threading.Lock()
+
+    def ok(self) -> None:
+        if not self.adaptive:
+            return
+        with self.lock:
+            if time.monotonic() - self.last_throttle > 60 and self.limit < self.max_limit:
+                self.limit = min(self.max_limit, int(self.limit * 1.3) + 1)
+
+    def throttled(self) -> None:
+        if not self.adaptive:
+            return
+        with self.lock:
+            self.last_throttle = time.monotonic()
+            # Never go back above the speed Google just refused.
+            self.max_limit = max(ITEMS_PER_MINUTE, int(self.limit * 0.9))
+            self.limit = max(10, self.limit // 2)
 
     def acquire(self, count: int) -> None:
         count = min(count, self.limit)
@@ -115,6 +140,28 @@ class _MinuteWindow:
 
 
 _minute_window = _MinuteWindow(ITEMS_PER_MINUTE)
+
+# A user's own key has its own Google quota, so it gets its own budget:
+# it is not slowed down by (and does not use up) NEXO's shared one.
+USER_KEY_ITEMS_PER_MINUTE = max(1, int(os.getenv("USER_KEY_ITEMS_PER_MINUTE", str(ITEMS_PER_MINUTE))))
+USER_KEY_MAX_ITEMS_PER_MINUTE = max(USER_KEY_ITEMS_PER_MINUTE, int(os.getenv("USER_KEY_MAX_ITEMS_PER_MINUTE", "3000")))
+_user_windows = {}
+_user_windows_lock = threading.Lock()
+
+
+def _window_for(key: str) -> "_MinuteWindow":
+    if not key or key == GEMINI_API_KEY:
+        return _minute_window
+    import hashlib
+
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]  # never keep the key itself
+    with _user_windows_lock:
+        window = _user_windows.get(digest)
+        if window is None:
+            if len(_user_windows) > 500:
+                _user_windows.clear()
+            window = _user_windows[digest] = _MinuteWindow(USER_KEY_ITEMS_PER_MINUTE, adaptive=True, max_limit=USER_KEY_MAX_ITEMS_PER_MINUTE)
+        return window
 
 
 def _retry_delay_seconds(response: "requests.Response") -> Optional[float]:
@@ -315,8 +362,11 @@ def _post_with_retries(
     - A per-DAY quota error is raised at once (retrying cannot help).
     """
 
+    api_key = user_keys.gemini_key(GEMINI_API_KEY)
+    window = _window_for(api_key)
+
     for attempt in range(max_retries):
-        _minute_window.acquire(item_count)
+        window.acquire(item_count)
 
         try:
             response = requests.post(
@@ -324,7 +374,7 @@ def _post_with_retries(
                 headers={
                     "Content-Type": "application/json",
                     # The user's own Gemini key when connected; same model, so vectors match.
-                    "x-goog-api-key": user_keys.gemini_key(GEMINI_API_KEY),
+                    "x-goog-api-key": api_key,
                 },
                 json=payload,
                 timeout=120,
@@ -339,6 +389,7 @@ def _post_with_retries(
             continue
 
         if response.ok:
+            window.ok()
             # Embeddings report no token count: estimate ~4 characters per token.
             try:
                 texts = [part.get("text", "") for request in payload.get("requests", [payload]) for part in (request.get("content") or {}).get("parts", [])]
@@ -353,6 +404,8 @@ def _post_with_retries(
         if response.status_code == 429:
             if _is_daily_quota(message):
                 raise GeminiQuotaError(message, daily=True)
+
+            window.throttled()
 
             if attempt == max_retries - 1:
                 raise GeminiQuotaError(message, daily=False)

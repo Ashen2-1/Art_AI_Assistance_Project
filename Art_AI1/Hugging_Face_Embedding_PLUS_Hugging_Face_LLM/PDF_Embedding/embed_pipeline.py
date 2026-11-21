@@ -156,11 +156,16 @@ def ingest_pdf(
 
     report_progress("reading", 0, 1)
 
-    chunks = process_document(
-        pdf_path,
-        chunk_size=chunk_size,
-        ocr_mode=ocr_mode,
-    )
+    # Only reading / OCR needs the memory: one document at a time there
+    # (memory_guard.py). Embedding is network work and runs side by side.
+    from memory_guard import heavy_slot
+
+    with heavy_slot(f"read {Path(pdf_path).name}"):
+        chunks = process_document(
+            pdf_path,
+            chunk_size=chunk_size,
+            ocr_mode=ocr_mode,
+        )
 
     if not chunks:
         print(
