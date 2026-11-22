@@ -198,6 +198,66 @@ def insert_chunks(
         conn.close()
 
 
+# ── Embedding cache ───────────────────────────────────────────
+# Vectors of passages already embedded, keyed by a hash of (model, size,
+# title, text); the text itself is not stored. A retry after a timeout or a
+# quota stop, or the same file uploaded again, reuses them instead of
+# spending the Gemini quota a second time.
+_cache_ready = False
+
+
+def _ensure_embedding_cache(cur) -> None:
+    global _cache_ready
+    if _cache_ready:
+        return
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+            key        TEXT PRIMARY KEY,
+            embedding  vector({EMBEDDING_DIM}) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("DELETE FROM embedding_cache WHERE created_at < NOW() - INTERVAL '30 days';")
+    _cache_ready = True
+
+
+def embedding_cache_get(keys: List[str]) -> dict:
+    if not keys:
+        return {}
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_embedding_cache(cur)
+            conn.commit()
+            cur.execute(
+                "SELECT key, embedding::real[] FROM embedding_cache WHERE key = ANY(%s);",
+                (list(keys),),
+            )
+            return {key: [float(value) for value in vector] for key, vector in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def embedding_cache_put(pairs: List[tuple]) -> None:
+    if not pairs:
+        return
+    from psycopg2.extras import execute_values
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_embedding_cache(cur)
+            execute_values(
+                cur,
+                "INSERT INTO embedding_cache (key, embedding) VALUES %s ON CONFLICT (key) DO NOTHING",
+                [(key, list(vector)) for key, vector in pairs],
+                template="(%s, %s::vector)",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def search_chunks(
     query_embedding: List[float],
     user_id: str,

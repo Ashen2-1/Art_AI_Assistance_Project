@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 # Windows console UTF-8 support
 if hasattr(sys.stdout, "reconfigure"):
@@ -21,7 +21,11 @@ from db import (
     init_db,
     insert_chunks,
     get_stats,
+    embedding_cache_get,
+    embedding_cache_put,
 )
+from gemini_embedding import EMBEDDING_DIM as GEMINI_EMBEDDING_DIM
+import hashlib
 from gemini_embedding import (
     EMBEDDING_MODEL,
     embed_documents,
@@ -98,6 +102,39 @@ def embed_texts(
         texts=texts,
         title=title,
     )
+
+
+def _cache_key(text: str, title: Optional[str]) -> str:
+    raw = f"{EMBEDDING_MODEL}|{GEMINI_EMBEDDING_DIM}|{title or ''}|{str(text).strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def embed_with_cache(texts: List[str], title: Optional[str] = None) -> List[List[float]]:
+    """
+    Embed passages, reusing vectors made before (a retry after a timeout or
+    a quota stop, or the same file uploaded again). Each finished batch is
+    saved right away, so a stop halfway keeps the part already paid for.
+    """
+    keys = [_cache_key(text, title) for text in texts]
+    try:
+        cached = embedding_cache_get(keys)
+    except Exception as error:
+        print(f"[Embed] Embedding cache unavailable: {error}")
+        cached = {}
+
+    missing = [index for index, key in enumerate(keys) if key not in cached]
+    if len(missing) < len(texts):
+        print(f"[Embed] Reusing {len(texts) - len(missing)} of {len(texts)} passages embedded before.")
+
+    if missing:
+        def save(batch_texts, vectors):
+            embedding_cache_put([(_cache_key(text, title), vector) for text, vector in zip(batch_texts, vectors)])
+
+        fresh = embed_documents([texts[index] for index in missing], title=title, on_batch=save)
+        for index, vector in zip(missing, fresh):
+            cached[keys[index]] = vector
+
+    return [cached[key] for key in keys]
 
 
 def ingest_pdf(
@@ -177,11 +214,8 @@ def ingest_pdf(
         f"[Embed] Extracted {len(chunks)} chunks."
     )
 
-    # Step 2: Gemini embeddings
-    embeddings = embed_texts(
-        texts=chunks,
-        title=source_name,
-    )
+    # Step 2: Gemini embeddings (passages embedded before are reused)
+    embeddings = embed_with_cache(chunks, title=source_name)
 
     if len(embeddings) != len(chunks):
         raise RuntimeError(
