@@ -104,12 +104,18 @@ def normalize_identity(
     return safe_user_id, safe_canvas_id
 
 
-def quota_error_message(error: "GeminiQuotaError") -> str:
+def quota_error_message(error: "GeminiQuotaError", own_key: bool = False) -> str:
+    if error.daily and (own_key or user_keys.using_own_gemini_key()):
+        return (
+            "Your own Gemini key has used today's free quota. The file is saved: "
+            "it can be indexed after the quota resets, or after billing is enabled "
+            "on that key in Google AI Studio."
+        )
     if error.daily:
         return (
-            "The AI service has used today's free Gemini quota. The file is saved, "
-            "but it can only be indexed after the quota resets (or after billing is "
-            "enabled on the Gemini API key)."
+            "NEXO's shared AI has used today's free Gemini quota. The file is saved: "
+            "connect your own free Gemini key in Settings → AI keys and press Retry "
+            "indexing to index it now, or try again after the quota resets."
         )
 
     return (
@@ -375,7 +381,7 @@ async def query_text_endpoint(
         raise HTTPException(status_code=400, detail=str(error))
 
     except GeminiQuotaError as error:
-        raise HTTPException(status_code=429, detail=quota_error_message(error))
+        raise HTTPException(status_code=429, detail=quota_error_message(error, bool(request_keys.get("gemini_key"))))
 
     except Exception as error:
         if request_keys.get("gemini_key") and _looks_like_bad_key(error):
@@ -566,9 +572,9 @@ async def ingest_document(
             ingest_progress.set_stage(safe_job_id, "error")
         print(f"[INGEST QUOTA] {original_filename}: daily={error.daily} {error}")
         if safe_job_id:
-            ingest_progress.set_result(safe_job_id, error=quota_error_message(error))
+            ingest_progress.set_result(safe_job_id, error=quota_error_message(error, bool(request_keys.get("gemini_key"))))
 
-        raise HTTPException(status_code=429, detail=quota_error_message(error))
+        raise HTTPException(status_code=429, detail=quota_error_message(error, bool(request_keys.get("gemini_key"))))
 
     except (UnsupportedDocumentError, ValueError) as error:
         # Clear, user-facing problems (unreadable file, legacy format, ...).
@@ -682,7 +688,7 @@ async def detective_analyze(
     except UserKeyError as error:
         raise HTTPException(status_code=400, detail=str(error))
     except GeminiQuotaError as error:
-        raise HTTPException(status_code=429, detail=quota_error_message(error))
+        raise HTTPException(status_code=429, detail=quota_error_message(error, bool(request_keys.get("gemini_key"))))
     except Exception as error:
         if request_keys.get("gemini_key") and _looks_like_bad_key(error):
             raise HTTPException(status_code=400, detail=OWN_GEMINI_KEY_REJECTED)
