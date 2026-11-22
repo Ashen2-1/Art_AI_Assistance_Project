@@ -487,6 +487,7 @@ def _embed_batch(
 def embed_documents(
     texts: List[str],
     title: Optional[str] = None,
+    on_batch=None,
 ) -> List[List[float]]:
     """
     Embed document chunks with batchEmbedContents.
@@ -530,7 +531,14 @@ def embed_documents(
             f"[Embedding] Batch {start + 1}-{end} of {total}"
         )
 
-        embeddings.extend(_embed_batch(batch, title))
+        vectors = _embed_batch(batch, title)
+        embeddings.extend(vectors)
+        if on_batch is not None:
+            # Saved at once, so a quota stop halfway keeps the finished part.
+            try:
+                on_batch(batch, vectors)
+            except Exception as error:  # the cache never breaks indexing
+                print(f"[Embedding] Could not cache a batch: {error}")
         report_progress("embedding", end, total)
 
         if end < total and delay_seconds > 0:
